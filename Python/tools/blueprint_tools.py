@@ -472,9 +472,9 @@ def register_blueprint_tools(mcp: FastMCP):
                 (make it with svn cat / .claude/tools/bpdiff.ps1).
             graph_name: Optional — restrict the (blueprint) graph diff to one graph.
 
-        Returns asset, asset_type, base, property_differences[] (property + change:
-        added/removed/changed), and for blueprints also graph_differences[] (category +
-        display + node GUIDs).
+        Returns asset, asset_type, base, property_differences[] (property, change:
+        added/removed/changed, and base_value/current_value), and for blueprints also
+        graph_differences[] (category + display + node GUIDs).
         """
         from unreal_mcp_server import get_unreal_connection
         try:

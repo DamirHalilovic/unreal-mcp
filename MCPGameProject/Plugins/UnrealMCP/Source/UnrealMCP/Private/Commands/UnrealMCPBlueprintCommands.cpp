@@ -361,6 +361,28 @@ namespace
         }
     }
 
+    // Resolve a property path on an object and export its value as text. FResolvedProperty.Object
+    // is the leaf's CONTAINER (DiffUtils.cpp Resolve), so the value is ContainerPtrToValuePtr.
+    FString MCPExportResolvedValue(const FPropertySoftPath& Path, const UObject* Obj)
+    {
+        if (!Obj)
+        {
+            return FString();
+        }
+        FResolvedProperty Resolved = Path.Resolve(Obj);
+        if (!Resolved.Property || !Resolved.Object)
+        {
+            return FString();
+        }
+        FString Value;
+        Resolved.Property->ExportTextItem_Direct(Value, Resolved.Property->ContainerPtrToValuePtr<void>(Resolved.Object), nullptr, nullptr, PPF_None);
+        if (Value.Len() > 240)
+        {
+            Value = Value.Left(240) + TEXT("…");
+        }
+        return Value;
+    }
+
     // Pair graphs by name between two blueprints and append the FGraphDiffControl
     // results as JSON. Shared by diff_blueprint and diff_asset.
     void MCPAppendBlueprintGraphDiffs(UBlueprint* BaseBP, UBlueprint* CurrentBP, const FString& GraphFilter,
@@ -839,6 +861,14 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleDiffAsset(const TShar
             TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
             Obj->SetStringField(TEXT("property"), Entry.Identifier.ToDisplayName());
             Obj->SetStringField(TEXT("change"), MCPPropertyDiffTypeToString(Entry.DiffType));
+            if (Entry.DiffType != EPropertyDiffType::PropertyAddedToB)
+            {
+                Obj->SetStringField(TEXT("base_value"), MCPExportResolvedValue(Entry.Identifier, PropA));
+            }
+            if (Entry.DiffType != EPropertyDiffType::PropertyAddedToA)
+            {
+                Obj->SetStringField(TEXT("current_value"), MCPExportResolvedValue(Entry.Identifier, PropB));
+            }
             PropDiffs.Add(MakeShared<FJsonValueObject>(Obj));
         }
     }
@@ -891,7 +921,7 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleGetAssetInfo(const TS
             continue;
         }
         FString Value;
-        Prop->ExportText_InContainer(0, Value, Asset, nullptr, Asset, PPF_None);
+        Prop->ExportTextItem_Direct(Value, Prop->ContainerPtrToValuePtr<void>(Asset), nullptr, nullptr, PPF_None);
         if (Value.Len() > 240)
         {
             Value = Value.Left(240) + TEXT("…");
