@@ -454,27 +454,38 @@ def register_blueprint_tools(mcp: FastMCP):
     @mcp.tool()
     def diff_asset(
         ctx: Context,
-        asset_name: str,
         base_version_path: str,
+        asset_name: str = "",
+        current_version_path: str = "",
         graph_name: str = ""
     ) -> Dict[str, Any]:
         """Structured diff of ANY asset against an older version — the tool detects the
         type itself and routes: Blueprints get a graph diff (FGraphDiffControl) plus a
-        property/CDO diff; data assets / curves / textures / meshes get a property
-        ('settings') diff via UE's CompareUnrelatedObjects. Not a visual/pixel diff.
+        property/CDO diff; actors get actor-level + per-component diffs (transform/scale/
+        mesh/materials and components added/removed); data assets/curves/textures/meshes
+        get a property ('settings') diff via CompareUnrelatedObjects. Not a visual diff.
 
-        Use this instead of diff_blueprint when you don't know (or don't want to assume)
-        the asset's type — a .uasset is opaque until loaded.
+        Use this instead of diff_blueprint when you don't know the asset's type — a
+        .uasset is opaque until loaded.
+
+        Specify the CURRENT side ONE of two ways:
+          - asset_name: a live, content-browser asset (blueprint, texture, data asset).
+          - current_version_path: a .uasset FILE. REQUIRED for World Partition external
+            actors and maps, which aren't resolvable as live assets — pass the
+            working-copy file (e.g. Project/Content/__ExternalActors__/.../<GUID>.uasset).
 
         Args:
-            asset_name: The CURRENT (live) asset — bare name, path, or /Game/ path.
             base_version_path: Absolute path to a .uasset of the OLDER revision
-                (make it with svn cat / .claude/tools/bpdiff.ps1).
+                (make it with `svn cat -r REV <url> > file` or bpdiff.ps1).
+            asset_name: Current live asset (bare name / path). Omit for external actors.
+            current_version_path: Current .uasset file (use for external actors/maps).
             graph_name: Optional — restrict the (blueprint) graph diff to one graph.
 
-        Returns asset, asset_type, base, property_differences[] (property, change:
-        added/removed/changed, and base_value/current_value), and for blueprints also
-        graph_differences[] (category + display + node GUIDs).
+        Returns asset, asset_type, base, property_differences[] (property, change, and
+        base_value/current_value); for blueprints also graph_differences[]; for actors
+        also component_differences[] (component, property, change, base_value/
+        current_value — incl. RelativeLocation/Rotation/Scale3D — or component_added/
+        component_removed).
         """
         from unreal_mcp_server import get_unreal_connection
         try:
@@ -483,7 +494,8 @@ def register_blueprint_tools(mcp: FastMCP):
                 return {"success": False, "message": "Failed to connect to Unreal Engine"}
             response = unreal.send_command(
                 "diff_asset",
-                {"asset_name": asset_name, "base_version_path": base_version_path, "graph_name": graph_name},
+                {"asset_name": asset_name, "current_version_path": current_version_path,
+                 "base_version_path": base_version_path, "graph_name": graph_name},
             )
             if not response:
                 return {"success": False, "message": "No response from Unreal Engine"}

@@ -36,6 +36,7 @@
 #include "Misc/Guid.h"
 #include "HAL/FileManager.h"
 #include "DiffUtils.h"
+#include "GameFramework/Actor.h"
 
 FUnrealMCPBlueprintCommands::FUnrealMCPBlueprintCommands()
 {
@@ -331,22 +332,39 @@ namespace
         }
         TArray<UObject*> Objects;
         GetObjectsWithPackage(Package, Objects);
+        UObject* Standalone = nullptr;   // normal asset (texture/blueprint/data asset)
+        UObject* Actor = nullptr;        // external-actor package: the actor IS the asset
         UObject* Fallback = nullptr;
         for (UObject* Obj : Objects)
         {
-            if (!Obj || Obj->IsA<UPackage>())
+            if (!Obj || Obj->IsA<UPackage>() || Obj->HasAnyFlags(RF_ClassDefaultObject))
             {
                 continue;
             }
-            if (Obj->HasAnyFlags(RF_Standalone))
+            if (Obj->GetClass()->GetName() == TEXT("MetaData"))
             {
-                return Obj;
+                continue;
             }
-            if (!Fallback)
+            if (!Actor && Obj->IsA<AActor>())
             {
-                Fallback = Obj;
+                Actor = Obj;  // OFPA actors aren't outered to the package, so don't filter on that
+            }
+            if (Obj->GetOuter() == Package)
+            {
+                if (!Standalone && Obj->HasAnyFlags(RF_Standalone))
+                {
+                    Standalone = Obj;
+                }
+                if (!Fallback)
+                {
+                    Fallback = Obj;
+                }
             }
         }
+        // A normal asset is the standalone top-level object; an external-actor package
+        // has no standalone asset, so use the actor.
+        if (Standalone) { return Standalone; }
+        if (Actor) { return Actor; }
         return Fallback;
     }
 
@@ -443,6 +461,65 @@ namespace
             if (!CurrentByName.Contains(Name))
             {
                 EmitPresence(Name, TEXT("subtraction"), FString::Printf(TEXT("Graph '%s' removed"), *Name));
+            }
+        }
+    }
+
+    // Actor-aware diff: an actor's meaningful changes (transform, mesh, materials) live
+    // inside components, which CompareUnrelatedObjects refuses to recurse into. So pair
+    // components by name and diff each directly, and report components added/removed.
+    void MCPAppendActorComponentDiffs(AActor* BaseActor, AActor* CurActor, TArray<TSharedPtr<FJsonValue>>& Diffs)
+    {
+        TArray<UActorComponent*> BaseComps;
+        TArray<UActorComponent*> CurComps;
+        BaseActor->GetComponents(BaseComps);
+        CurActor->GetComponents(CurComps);
+        TMap<FString, UActorComponent*> BaseByName;
+        TMap<FString, UActorComponent*> CurByName;
+        for (UActorComponent* Comp : BaseComps) { if (Comp) { BaseByName.Add(Comp->GetName(), Comp); } }
+        for (UActorComponent* Comp : CurComps) { if (Comp) { CurByName.Add(Comp->GetName(), Comp); } }
+
+        for (const TPair<FString, UActorComponent*>& Pair : CurByName)
+        {
+            const FString& Name = Pair.Key;
+            UActorComponent** BaseComp = BaseByName.Find(Name);
+            if (!BaseComp)
+            {
+                TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+                Entry->SetStringField(TEXT("component"), Name);
+                Entry->SetStringField(TEXT("change"), TEXT("component_added"));
+                Entry->SetStringField(TEXT("current_value"), Pair.Value->GetClass()->GetName());
+                Diffs.Add(MakeShared<FJsonValueObject>(Entry));
+                continue;
+            }
+            TArray<FSingleObjectDiffEntry> Entries;
+            DiffUtils::CompareUnrelatedObjects(*BaseComp, Pair.Value, Entries);
+            for (const FSingleObjectDiffEntry& Entry : Entries)
+            {
+                TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+                Obj->SetStringField(TEXT("component"), Name);
+                Obj->SetStringField(TEXT("property"), Entry.Identifier.ToDisplayName());
+                Obj->SetStringField(TEXT("change"), MCPPropertyDiffTypeToString(Entry.DiffType));
+                if (Entry.DiffType != EPropertyDiffType::PropertyAddedToB)
+                {
+                    Obj->SetStringField(TEXT("base_value"), MCPExportResolvedValue(Entry.Identifier, *BaseComp));
+                }
+                if (Entry.DiffType != EPropertyDiffType::PropertyAddedToA)
+                {
+                    Obj->SetStringField(TEXT("current_value"), MCPExportResolvedValue(Entry.Identifier, Pair.Value));
+                }
+                Diffs.Add(MakeShared<FJsonValueObject>(Obj));
+            }
+        }
+        for (const TPair<FString, UActorComponent*>& Pair : BaseByName)
+        {
+            if (!CurByName.Contains(Pair.Key))
+            {
+                TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+                Entry->SetStringField(TEXT("component"), Pair.Key);
+                Entry->SetStringField(TEXT("change"), TEXT("component_removed"));
+                Entry->SetStringField(TEXT("base_value"), Pair.Value->GetClass()->GetName());
+                Diffs.Add(MakeShared<FJsonValueObject>(Entry));
             }
         }
     }
@@ -801,22 +878,27 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleDiffBlueprint(const T
 TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleDiffAsset(const TSharedPtr<FJsonObject>& Params)
 {
     FString AssetName;
-    if (!Params->TryGetStringField(TEXT("asset_name"), AssetName))
-    {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'asset_name' parameter"));
-    }
+    Params->TryGetStringField(TEXT("asset_name"), AssetName);
+    FString CurrentPath;
+    Params->TryGetStringField(TEXT("current_version_path"), CurrentPath);
     FString BasePath;
     if (!Params->TryGetStringField(TEXT("base_version_path"), BasePath))
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'base_version_path' parameter"));
     }
+    if (AssetName.IsEmpty() && CurrentPath.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Provide 'asset_name' (a live asset) or 'current_version_path' (a .uasset file)"));
+    }
     FString GraphFilter;
     Params->TryGetStringField(TEXT("graph_name"), GraphFilter);
 
-    UObject* Current = MCPFindAssetFlexible(AssetName);
+    // Current side: a live asset by name, or a .uasset file (needed for World Partition
+    // external actors, which aren't resolvable as live assets).
+    UObject* Current = CurrentPath.IsEmpty() ? MCPFindAssetFlexible(AssetName) : MCPLoadAssetForDiff(CurrentPath);
     if (!Current)
     {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Asset not found: %s"), *AssetName));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Could not resolve current asset: %s"), *(CurrentPath.IsEmpty() ? AssetName : CurrentPath)));
     }
     UObject* Base = MCPLoadAssetForDiff(BasePath);
     if (!Base)
@@ -874,6 +956,19 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleDiffAsset(const TShar
     }
     Data->SetNumberField(TEXT("num_property_differences"), PropDiffs.Num());
     Data->SetArrayField(TEXT("property_differences"), PropDiffs);
+
+    // Actors: pair components and diff each (transform, mesh, materials, add/remove) —
+    // CompareUnrelatedObjects above skips component subobjects.
+    if (AActor* CurActor = Cast<AActor>(Current))
+    {
+        if (AActor* BaseActor = Cast<AActor>(Base))
+        {
+            TArray<TSharedPtr<FJsonValue>> CompDiffs;
+            MCPAppendActorComponentDiffs(BaseActor, CurActor, CompDiffs);
+            Data->SetNumberField(TEXT("num_component_differences"), CompDiffs.Num());
+            Data->SetArrayField(TEXT("component_differences"), CompDiffs);
+        }
+    }
 
     return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
 }
