@@ -7,6 +7,8 @@
 #include "K2Node_Event.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
+#include "K2Node_CallFunction.h"
+#include "K2Node_MacroInstance.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/BoxComponent.h"
 #include "Components/SphereComponent.h"
@@ -378,6 +380,35 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleGetBlueprintGraph(con
         NodeObj->SetStringField(TEXT("id"), Node->NodeGuid.ToString());
         NodeObj->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
         NodeObj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+
+        // Resolve call targets so a trace reads as real calls, not node classes.
+        if (UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node))
+        {
+            if (UFunction* Func = CallNode->GetTargetFunction())
+            {
+                NodeObj->SetStringField(TEXT("target_function"), Func->GetName());
+                if (UClass* Owner = Func->GetOwnerClass())
+                {
+                    NodeObj->SetStringField(TEXT("target_class"), Owner->GetName());
+                }
+            }
+            else
+            {
+                // GetTargetFunction can be null pre-compile; fall back to the reference.
+                const FName MemberName = CallNode->FunctionReference.GetMemberName();
+                if (MemberName != NAME_None)
+                {
+                    NodeObj->SetStringField(TEXT("target_function"), MemberName.ToString());
+                }
+            }
+        }
+        else if (UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(Node))
+        {
+            if (UEdGraph* MacroGraph = MacroNode->GetMacroGraph())
+            {
+                NodeObj->SetStringField(TEXT("target_macro"), MacroGraph->GetName());
+            }
+        }
 
         TArray<TSharedPtr<FJsonValue>> Pins;
         for (UEdGraphPin* Pin : Node->Pins)
