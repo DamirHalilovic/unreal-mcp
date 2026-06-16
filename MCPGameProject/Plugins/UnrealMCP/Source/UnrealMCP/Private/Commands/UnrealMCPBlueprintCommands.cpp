@@ -28,6 +28,12 @@
 #include "EdGraph/EdGraphPin.h"
 #include "UObject/UnrealType.h"
 #include "Misc/Paths.h"
+#include "GraphDiffControl.h"
+#include "DiffResults.h"
+#include "UObject/Package.h"
+#include "UObject/UObjectHash.h"
+#include "Misc/PackageName.h"
+#include "HAL/FileManager.h"
 
 FUnrealMCPBlueprintCommands::FUnrealMCPBlueprintCommands()
 {
@@ -78,6 +84,10 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleCommand(const FString
     else if (CommandType == TEXT("get_blueprint_graph"))
     {
         return HandleGetBlueprintGraph(Params);
+    }
+    else if (CommandType == TEXT("diff_blueprint"))
+    {
+        return HandleDiffBlueprint(Params);
     }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown blueprint command: %s"), *CommandType));
@@ -199,6 +209,57 @@ namespace
             MCPAddGraphRecursive(Graph, TEXT("delegate"), Out);
         }
         return Out;
+    }
+
+    FString MCPDiffCategoryToString(EDiffType::Category Category)
+    {
+        switch (Category)
+        {
+            case EDiffType::ADDITION:     return TEXT("addition");
+            case EDiffType::SUBTRACTION:  return TEXT("subtraction");
+            case EDiffType::MODIFICATION: return TEXT("modification");
+            case EDiffType::MINOR:        return TEXT("minor");
+            case EDiffType::CONTROL:      return TEXT("control");
+            default:                      return TEXT("unknown");
+        }
+    }
+
+    // Load a .uasset from an arbitrary path as a separate copy for diffing against
+    // the live asset, mirroring the engine's own -diff load path (copy into DiffDir,
+    // then LoadPackage with LOAD_ForDiff so it doesn't clobber the loaded original).
+    UBlueprint* MCPLoadBlueprintForDiff(const FString& InPath)
+    {
+        if (!FPaths::FileExists(InPath))
+        {
+            return nullptr;
+        }
+        FString BaseName = FPaths::GetBaseFilename(InPath);
+        const TCHAR* Invalid = INVALID_LONGPACKAGE_CHARACTERS;
+        for (; *Invalid; ++Invalid)
+        {
+            const TCHAR InvalidStr[] = { *Invalid, '\0' };
+            BaseName.ReplaceInline(InvalidStr, TEXT("_"));
+        }
+        const FString DiffPath = FString::Printf(TEXT("%s%s_mcpdiff%s"), *FPaths::DiffDir(), *BaseName, *FPaths::GetExtension(InPath, true));
+        if (IFileManager::Get().Copy(*DiffPath, *InPath, true, true) != COPY_OK)
+        {
+            return nullptr;
+        }
+        UPackage* Package = LoadPackage(nullptr, *DiffPath, LOAD_ForDiff);
+        if (!Package)
+        {
+            return nullptr;
+        }
+        TArray<UObject*> Objects;
+        GetObjectsWithPackage(Package, Objects);
+        for (UObject* Obj : Objects)
+        {
+            if (UBlueprint* BP = Cast<UBlueprint>(Obj))
+            {
+                return BP;
+            }
+        }
+        return nullptr;
     }
 }
 
@@ -449,6 +510,106 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleGetBlueprintGraph(con
     }
     Data->SetArrayField(TEXT("nodes"), Nodes);
 
+    return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleDiffBlueprint(const TSharedPtr<FJsonObject>& Params)
+{
+    FString BlueprintName;
+    if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
+    }
+    FString BasePath;
+    if (!Params->TryGetStringField(TEXT("base_version_path"), BasePath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'base_version_path' parameter (a .uasset of the revision to compare against)"));
+    }
+    FString GraphFilter;
+    Params->TryGetStringField(TEXT("graph_name"), GraphFilter);
+
+    UBlueprint* CurrentBP = MCPFindBlueprintFlexible(BlueprintName);
+    if (!CurrentBP)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+    UBlueprint* BaseBP = MCPLoadBlueprintForDiff(BasePath);
+    if (!BaseBP)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Could not load base version as a blueprint: %s"), *BasePath));
+    }
+
+    TMap<FString, UEdGraph*> BaseByName;
+    for (const FMCPGraphEntry& Entry : MCPCollectAllGraphs(BaseBP))
+    {
+        if (Entry.Graph) { BaseByName.Add(Entry.Graph->GetName(), Entry.Graph); }
+    }
+    TMap<FString, UEdGraph*> CurrentByName;
+    for (const FMCPGraphEntry& Entry : MCPCollectAllGraphs(CurrentBP))
+    {
+        if (Entry.Graph) { CurrentByName.Add(Entry.Graph->GetName(), Entry.Graph); }
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Diffs;
+    int32 GraphsCompared = 0;
+
+    auto EmitGraphPresence = [&Diffs](const FString& GraphName, const TCHAR* Category, const FString& Display)
+    {
+        TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+        Entry->SetStringField(TEXT("graph"), GraphName);
+        Entry->SetStringField(TEXT("category"), Category);
+        Entry->SetStringField(TEXT("display"), Display);
+        Diffs.Add(MakeShared<FJsonValueObject>(Entry));
+    };
+
+    // Diff graphs present in the current asset (base -> current).
+    for (const TPair<FString, UEdGraph*>& Pair : CurrentByName)
+    {
+        const FString& Name = Pair.Key;
+        if (!GraphFilter.IsEmpty() && !Name.Equals(GraphFilter, ESearchCase::IgnoreCase)) { continue; }
+        UEdGraph** BaseGraph = BaseByName.Find(Name);
+        if (!BaseGraph)
+        {
+            EmitGraphPresence(Name, TEXT("addition"), FString::Printf(TEXT("Graph '%s' added"), *Name));
+            continue;
+        }
+        ++GraphsCompared;
+        TArray<FDiffSingleResult> Results;
+        FGraphDiffControl::DiffGraphs(*BaseGraph, Pair.Value, Results);
+        for (const FDiffSingleResult& Result : Results)
+        {
+            if (Result.Diff == EDiffType::NO_DIFFERENCE) { continue; }
+            TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+            Entry->SetStringField(TEXT("graph"), Name);
+            Entry->SetStringField(TEXT("category"), MCPDiffCategoryToString(Result.Category));
+            Entry->SetNumberField(TEXT("type_id"), (int32)Result.Diff);
+            Entry->SetStringField(TEXT("display"), Result.DisplayString.ToString());
+            if (!Result.ToolTip.IsEmpty()) { Entry->SetStringField(TEXT("tooltip"), Result.ToolTip.ToString()); }
+            if (Result.Node1) { Entry->SetStringField(TEXT("base_node"), Result.Node1->NodeGuid.ToString()); }
+            if (Result.Node2) { Entry->SetStringField(TEXT("current_node"), Result.Node2->NodeGuid.ToString()); }
+            if (Result.Pin1) { Entry->SetStringField(TEXT("base_pin"), Result.Pin1->PinName.ToString()); }
+            if (Result.Pin2) { Entry->SetStringField(TEXT("current_pin"), Result.Pin2->PinName.ToString()); }
+            Diffs.Add(MakeShared<FJsonValueObject>(Entry));
+        }
+    }
+
+    // Graphs that existed in the base but were removed.
+    for (const TPair<FString, UEdGraph*>& Pair : BaseByName)
+    {
+        const FString& Name = Pair.Key;
+        if (!GraphFilter.IsEmpty() && !Name.Equals(GraphFilter, ESearchCase::IgnoreCase)) { continue; }
+        if (!CurrentByName.Contains(Name))
+        {
+            EmitGraphPresence(Name, TEXT("subtraction"), FString::Printf(TEXT("Graph '%s' removed"), *Name));
+        }
+    }
+
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetStringField(TEXT("blueprint"), CurrentBP->GetName());
+    Data->SetStringField(TEXT("base"), BasePath);
+    Data->SetNumberField(TEXT("graphs_compared"), GraphsCompared);
+    Data->SetNumberField(TEXT("num_differences"), Diffs.Num());
+    Data->SetArrayField(TEXT("differences"), Diffs);
     return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
 }
 

@@ -370,6 +370,57 @@ def register_blueprint_tools(mcp: FastMCP):
             return {"success": False, "message": error_msg}
 
     @mcp.tool()
+    def diff_blueprint(
+        ctx: Context,
+        blueprint_name: str,
+        base_version_path: str,
+        graph_name: str = ""
+    ) -> Dict[str, Any]:
+        """Structured graph diff of a Blueprint against an older version, using UE's
+        own graph differ (FGraphDiffControl) — the same one the visual diff tool uses.
+
+        Output is O(changes), not O(blueprint): only actual differences are returned,
+        each as a classified, pre-described entry (no re-parsing both graphs).
+
+        Args:
+            blueprint_name: The CURRENT (live) blueprint — bare name, path, or
+                /Game/ name. This is the 'new' side.
+            base_version_path: Absolute path to a .uasset of the OLDER revision to
+                compare against (the 'base' side). Produce it with svn cat / the
+                bpdiff helper, e.g. ...\\Temp\\bpdiff\\CH_FirstPersonPlayable_r214701.uasset
+            graph_name: Optional — restrict the diff to a single graph.
+
+        Returns blueprint, base, graphs_compared, num_differences, and differences[]
+        where each entry has graph, category (addition/subtraction/modification/minor),
+        a human display string, and the base_node/current_node GUIDs (same GUID
+        vocabulary as get_blueprint_graph, so you can drill into a changed node).
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                logger.error("Failed to connect to Unreal Engine")
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+
+            response = unreal.send_command(
+                "diff_blueprint",
+                {"blueprint_name": blueprint_name, "base_version_path": base_version_path, "graph_name": graph_name},
+            )
+
+            if not response:
+                logger.error("No response from Unreal Engine")
+                return {"success": False, "message": "No response from Unreal Engine"}
+
+            logger.info(f"Diff blueprint response received ({len(str(response))} chars)")
+            return response
+
+        except Exception as e:
+            error_msg = f"Error diffing blueprint: {e}"
+            logger.error(error_msg)
+            return {"success": False, "message": error_msg}
+
+    @mcp.tool()
     def set_blueprint_property(
         ctx: Context,
         blueprint_name: str,
