@@ -247,7 +247,8 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("set_blueprint_property") || 
                      CommandType == TEXT("set_static_mesh_properties") ||
                      CommandType == TEXT("set_pawn_properties") ||
-                     CommandType == TEXT("get_blueprint_info"))
+                     CommandType == TEXT("get_blueprint_info") ||
+                     CommandType == TEXT("get_blueprint_graph"))
             {
                 ResultJson = BlueprintCommands->HandleCommand(CommandType, Params);
             }

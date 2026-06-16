@@ -321,6 +321,55 @@ def register_blueprint_tools(mcp: FastMCP):
             return {"success": False, "message": error_msg}
 
     @mcp.tool()
+    def get_blueprint_graph(
+        ctx: Context,
+        blueprint_name: str,
+        graph_name: str = ""
+    ) -> Dict[str, Any]:
+        """Dump one graph of a Blueprint at node + pin-connection level, for tracing logic.
+
+        Graphs include event graphs, functions, the construction script
+        (UserConstructionScript), macros, delegate signatures, and nested
+        (collapsed) subgraphs.
+
+        Args:
+            blueprint_name: Bare asset name, full object path, or /Game/Blueprints/ name.
+            graph_name: The graph to dump (e.g. "CanHardFlinch", "EventGraph",
+                "UserConstructionScript"). Leave EMPTY to first LIST every graph
+                (name + category + num_nodes) and choose one. On a miss, the error
+                lists the available graphs.
+
+        With graph_name: returns blueprint, graph, category, num_nodes, and nodes[]
+        where each node has id (GUID), title, class, and pins[] (name, direction
+        in/out, type, default, and links[] = {node, pin} of every connected pin).
+        Prefer a specific function/macro over the full EventGraph, which can be huge.
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                logger.error("Failed to connect to Unreal Engine")
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+
+            response = unreal.send_command(
+                "get_blueprint_graph",
+                {"blueprint_name": blueprint_name, "graph_name": graph_name},
+            )
+
+            if not response:
+                logger.error("No response from Unreal Engine")
+                return {"success": False, "message": "No response from Unreal Engine"}
+
+            logger.info(f"Get blueprint graph response received ({len(str(response))} chars)")
+            return response
+
+        except Exception as e:
+            error_msg = f"Error getting blueprint graph: {e}"
+            logger.error(error_msg)
+            return {"success": False, "message": error_msg}
+
+    @mcp.tool()
     def set_blueprint_property(
         ctx: Context,
         blueprint_name: str,
