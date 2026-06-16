@@ -37,6 +37,9 @@
 #include "HAL/FileManager.h"
 #include "DiffUtils.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/WorldSettings.h"
+#include "Engine/World.h"
+#include "Engine/Level.h"
 
 FUnrealMCPBlueprintCommands::FUnrealMCPBlueprintCommands()
 {
@@ -401,6 +404,25 @@ namespace
         return Value;
     }
 
+    // True if the property is an object reference to one of the actor's components.
+    // Across two loaded versions such refs differ only by package path (pure noise);
+    // real component changes are reported by the per-component diff instead.
+    bool MCPIsComponentRef(const FPropertySoftPath& Path, const UObject* Obj)
+    {
+        if (!Obj)
+        {
+            return false;
+        }
+        FResolvedProperty Resolved = Path.Resolve(Obj);
+        const FObjectPropertyBase* ObjProp = Resolved.Property ? CastField<FObjectPropertyBase>(Resolved.Property) : nullptr;
+        if (!ObjProp || !Resolved.Object)
+        {
+            return false;
+        }
+        const UObject* Ref = ObjProp->GetObjectPropertyValue(Resolved.Property->ContainerPtrToValuePtr<void>(Resolved.Object));
+        return Ref && Ref->IsA<UActorComponent>();
+    }
+
     // Pair graphs by name between two blueprints and append the FGraphDiffControl
     // results as JSON. Shared by diff_blueprint and diff_asset.
     void MCPAppendBlueprintGraphDiffs(UBlueprint* BaseBP, UBlueprint* CurrentBP, const FString& GraphFilter,
@@ -468,8 +490,14 @@ namespace
     // Actor-aware diff: an actor's meaningful changes (transform, mesh, materials) live
     // inside components, which CompareUnrelatedObjects refuses to recurse into. So pair
     // components by name and diff each directly, and report components added/removed.
-    void MCPAppendActorComponentDiffs(AActor* BaseActor, AActor* CurActor, TArray<TSharedPtr<FJsonValue>>& Diffs)
+    void MCPAppendActorComponentDiffs(AActor* BaseActor, AActor* CurActor, const FString& ActorLabel, TArray<TSharedPtr<FJsonValue>>& Diffs)
     {
+        auto Tag = [&ActorLabel](TSharedPtr<FJsonObject> Entry) -> TSharedPtr<FJsonObject>
+        {
+            if (!ActorLabel.IsEmpty()) { Entry->SetStringField(TEXT("actor"), ActorLabel); }
+            return Entry;
+        };
+
         TArray<UActorComponent*> BaseComps;
         TArray<UActorComponent*> CurComps;
         BaseActor->GetComponents(BaseComps);
@@ -489,7 +517,7 @@ namespace
                 Entry->SetStringField(TEXT("component"), Name);
                 Entry->SetStringField(TEXT("change"), TEXT("component_added"));
                 Entry->SetStringField(TEXT("current_value"), Pair.Value->GetClass()->GetName());
-                Diffs.Add(MakeShared<FJsonValueObject>(Entry));
+                Diffs.Add(MakeShared<FJsonValueObject>(Tag(Entry)));
                 continue;
             }
             TArray<FSingleObjectDiffEntry> Entries;
@@ -508,7 +536,7 @@ namespace
                 {
                     Obj->SetStringField(TEXT("current_value"), MCPExportResolvedValue(Entry.Identifier, Pair.Value));
                 }
-                Diffs.Add(MakeShared<FJsonValueObject>(Obj));
+                Diffs.Add(MakeShared<FJsonValueObject>(Tag(Obj)));
             }
         }
         for (const TPair<FString, UActorComponent*>& Pair : BaseByName)
@@ -518,6 +546,74 @@ namespace
                 TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
                 Entry->SetStringField(TEXT("component"), Pair.Key);
                 Entry->SetStringField(TEXT("change"), TEXT("component_removed"));
+                Entry->SetStringField(TEXT("base_value"), Pair.Value->GetClass()->GetName());
+                Diffs.Add(MakeShared<FJsonValueObject>(Tag(Entry)));
+            }
+        }
+    }
+
+    // Full single-actor diff: actor-level properties + per-component diffs, all tagged
+    // with the actor label.
+    void MCPDiffActor(AActor* BaseActor, AActor* CurActor, const FString& ActorLabel, TArray<TSharedPtr<FJsonValue>>& Diffs)
+    {
+        TArray<FSingleObjectDiffEntry> ActorEntries;
+        DiffUtils::CompareUnrelatedObjects(BaseActor, CurActor, ActorEntries);
+        for (const FSingleObjectDiffEntry& Entry : ActorEntries)
+        {
+            if (MCPIsComponentRef(Entry.Identifier, CurActor)) { continue; }
+            TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+            if (!ActorLabel.IsEmpty()) { Obj->SetStringField(TEXT("actor"), ActorLabel); }
+            Obj->SetStringField(TEXT("property"), Entry.Identifier.ToDisplayName());
+            Obj->SetStringField(TEXT("change"), MCPPropertyDiffTypeToString(Entry.DiffType));
+            if (Entry.DiffType != EPropertyDiffType::PropertyAddedToB)
+            {
+                Obj->SetStringField(TEXT("base_value"), MCPExportResolvedValue(Entry.Identifier, BaseActor));
+            }
+            if (Entry.DiffType != EPropertyDiffType::PropertyAddedToA)
+            {
+                Obj->SetStringField(TEXT("current_value"), MCPExportResolvedValue(Entry.Identifier, CurActor));
+            }
+            Diffs.Add(MakeShared<FJsonValueObject>(Obj));
+        }
+        MCPAppendActorComponentDiffs(BaseActor, CurActor, ActorLabel, Diffs);
+    }
+
+    // Diff the actors of two worlds' persistent levels (non-OFPA maps embed their
+    // actors here; for World Partition maps this is mostly streaming/world setup).
+    void MCPDiffLevelActors(UWorld* BaseWorld, UWorld* CurWorld, TArray<TSharedPtr<FJsonValue>>& Diffs)
+    {
+        TMap<FString, AActor*> BaseByName;
+        TMap<FString, AActor*> CurByName;
+        if (BaseWorld->PersistentLevel)
+        {
+            for (AActor* Actor : BaseWorld->PersistentLevel->Actors) { if (Actor) { BaseByName.Add(Actor->GetName(), Actor); } }
+        }
+        if (CurWorld->PersistentLevel)
+        {
+            for (AActor* Actor : CurWorld->PersistentLevel->Actors) { if (Actor) { CurByName.Add(Actor->GetName(), Actor); } }
+        }
+
+        for (const TPair<FString, AActor*>& Pair : CurByName)
+        {
+            AActor** BaseActor = BaseByName.Find(Pair.Key);
+            if (!BaseActor)
+            {
+                TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+                Entry->SetStringField(TEXT("actor"), Pair.Key);
+                Entry->SetStringField(TEXT("change"), TEXT("actor_added"));
+                Entry->SetStringField(TEXT("current_value"), Pair.Value->GetClass()->GetName());
+                Diffs.Add(MakeShared<FJsonValueObject>(Entry));
+                continue;
+            }
+            MCPDiffActor(*BaseActor, Pair.Value, Pair.Key, Diffs);
+        }
+        for (const TPair<FString, AActor*>& Pair : BaseByName)
+        {
+            if (!CurByName.Contains(Pair.Key))
+            {
+                TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+                Entry->SetStringField(TEXT("actor"), Pair.Key);
+                Entry->SetStringField(TEXT("change"), TEXT("actor_removed"));
                 Entry->SetStringField(TEXT("base_value"), Pair.Value->GetClass()->GetName());
                 Diffs.Add(MakeShared<FJsonValueObject>(Entry));
             }
@@ -934,12 +1030,13 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleDiffAsset(const TShar
         PropB = CurrentBP->GeneratedClass ? CurrentBP->GeneratedClass->GetDefaultObject() : nullptr;
     }
     TArray<TSharedPtr<FJsonValue>> PropDiffs;
-    if (PropA && PropB)
+    if (PropA && PropB && !Cast<UWorld>(Current))
     {
         TArray<FSingleObjectDiffEntry> Entries;
         DiffUtils::CompareUnrelatedObjects(PropA, PropB, Entries);
         for (const FSingleObjectDiffEntry& Entry : Entries)
         {
+            if (MCPIsComponentRef(Entry.Identifier, PropB)) { continue; }
             TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
             Obj->SetStringField(TEXT("property"), Entry.Identifier.ToDisplayName());
             Obj->SetStringField(TEXT("change"), MCPPropertyDiffTypeToString(Entry.DiffType));
@@ -964,9 +1061,39 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleDiffAsset(const TShar
         if (AActor* BaseActor = Cast<AActor>(Base))
         {
             TArray<TSharedPtr<FJsonValue>> CompDiffs;
-            MCPAppendActorComponentDiffs(BaseActor, CurActor, CompDiffs);
+            MCPAppendActorComponentDiffs(BaseActor, CurActor, FString(), CompDiffs);
             Data->SetNumberField(TEXT("num_component_differences"), CompDiffs.Num());
             Data->SetArrayField(TEXT("component_differences"), CompDiffs);
+        }
+    }
+    // Maps: world-settings diff + per-actor diffs of the persistent level.
+    else if (UWorld* CurWorld = Cast<UWorld>(Current))
+    {
+        if (UWorld* BaseWorld = Cast<UWorld>(Base))
+        {
+            TArray<TSharedPtr<FJsonValue>> WorldSettingsDiffs;
+            AWorldSettings* BaseWS = BaseWorld->GetWorldSettings(false, false);
+            AWorldSettings* CurWS = CurWorld->GetWorldSettings(false, false);
+            if (BaseWS && CurWS)
+            {
+                TArray<FSingleObjectDiffEntry> Entries;
+                DiffUtils::CompareUnrelatedObjects(BaseWS, CurWS, Entries);
+                for (const FSingleObjectDiffEntry& Entry : Entries)
+                {
+                    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+                    Obj->SetStringField(TEXT("property"), Entry.Identifier.ToDisplayName());
+                    Obj->SetStringField(TEXT("change"), MCPPropertyDiffTypeToString(Entry.DiffType));
+                    if (Entry.DiffType != EPropertyDiffType::PropertyAddedToB) { Obj->SetStringField(TEXT("base_value"), MCPExportResolvedValue(Entry.Identifier, BaseWS)); }
+                    if (Entry.DiffType != EPropertyDiffType::PropertyAddedToA) { Obj->SetStringField(TEXT("current_value"), MCPExportResolvedValue(Entry.Identifier, CurWS)); }
+                    WorldSettingsDiffs.Add(MakeShared<FJsonValueObject>(Obj));
+                }
+            }
+            Data->SetArrayField(TEXT("world_settings_differences"), WorldSettingsDiffs);
+
+            TArray<TSharedPtr<FJsonValue>> ActorDiffs;
+            MCPDiffLevelActors(BaseWorld, CurWorld, ActorDiffs);
+            Data->SetNumberField(TEXT("num_actor_differences"), ActorDiffs.Num());
+            Data->SetArrayField(TEXT("actor_differences"), ActorDiffs);
         }
     }
 
