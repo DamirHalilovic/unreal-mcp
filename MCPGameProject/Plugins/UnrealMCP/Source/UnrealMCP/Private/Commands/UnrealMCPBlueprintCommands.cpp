@@ -33,6 +33,7 @@
 #include "UObject/Package.h"
 #include "UObject/UObjectHash.h"
 #include "Misc/PackageName.h"
+#include "Misc/Guid.h"
 #include "HAL/FileManager.h"
 
 FUnrealMCPBlueprintCommands::FUnrealMCPBlueprintCommands()
@@ -131,7 +132,10 @@ namespace
                 return BP;
             }
         }
-        if (UBlueprint* BP = FUnrealMCPCommonUtils::FindBlueprint(Identifier))
+        // Legacy /Game/Blueprints/<name> location — quiet, since most assets live
+        // elsewhere and the asset-registry search below is the real resolver.
+        const FString LegacyPath = TEXT("/Game/Blueprints/") + Identifier;
+        if (UBlueprint* BP = LoadObject<UBlueprint>(nullptr, *LegacyPath, nullptr, LOAD_NoWarn))
         {
             return BP;
         }
@@ -240,7 +244,9 @@ namespace
             const TCHAR InvalidStr[] = { *Invalid, '\0' };
             BaseName.ReplaceInline(InvalidStr, TEXT("_"));
         }
-        const FString DiffPath = FString::Printf(TEXT("%s%s_mcpdiff%s"), *FPaths::DiffDir(), *BaseName, *FPaths::GetExtension(InPath, true));
+        // Unique per load: re-diffing the same file must not collide with a package
+        // already loaded for diff this session.
+        const FString DiffPath = FString::Printf(TEXT("%s%s_mcpdiff_%s%s"), *FPaths::DiffDir(), *BaseName, *FGuid::NewGuid().ToString(EGuidFormats::Digits), *FPaths::GetExtension(InPath, true));
         if (IFileManager::Get().Copy(*DiffPath, *InPath, true, true) != COPY_OK)
         {
             return nullptr;
