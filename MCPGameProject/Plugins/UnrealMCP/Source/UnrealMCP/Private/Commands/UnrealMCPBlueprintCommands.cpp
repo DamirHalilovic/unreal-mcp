@@ -20,6 +20,10 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
+#include "Components/ActorComponent.h"
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphPin.h"
+#include "Misc/Paths.h"
 
 FUnrealMCPBlueprintCommands::FUnrealMCPBlueprintCommands()
 {
@@ -63,8 +67,158 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleCommand(const FString
     {
         return HandleSetPawnProperties(Params);
     }
-    
+    else if (CommandType == TEXT("get_blueprint_info"))
+    {
+        return HandleGetBlueprintInfo(Params);
+    }
+
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown blueprint command: %s"), *CommandType));
+}
+
+namespace
+{
+    FString MCPPinTypeToString(const FEdGraphPinType& PinType)
+    {
+        FString Base = PinType.PinCategory.ToString();
+        if (PinType.PinSubCategoryObject.IsValid())
+        {
+            Base += FString::Printf(TEXT("(%s)"), *PinType.PinSubCategoryObject->GetName());
+        }
+        else if (!PinType.PinSubCategory.IsNone())
+        {
+            Base += FString::Printf(TEXT("(%s)"), *PinType.PinSubCategory.ToString());
+        }
+        switch (PinType.ContainerType)
+        {
+            case EPinContainerType::Array: Base += TEXT("[]"); break;
+            case EPinContainerType::Set:   Base += TEXT("{set}"); break;
+            case EPinContainerType::Map:   Base += TEXT("{map}"); break;
+            default: break;
+        }
+        return Base;
+    }
+
+    // Resolve a blueprint by bare name (anywhere in the project), full object path,
+    // or the legacy /Game/Blueprints/<name> location.
+    UBlueprint* MCPFindBlueprintFlexible(const FString& Identifier)
+    {
+        if (Identifier.IsEmpty())
+        {
+            return nullptr;
+        }
+        if (Identifier.StartsWith(TEXT("/")))
+        {
+            if (UBlueprint* BP = LoadObject<UBlueprint>(nullptr, *Identifier))
+            {
+                return BP;
+            }
+        }
+        if (UBlueprint* BP = FUnrealMCPCommonUtils::FindBlueprint(Identifier))
+        {
+            return BP;
+        }
+
+        FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+        FARFilter Filter;
+        Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+        Filter.bRecursiveClasses = true;
+        TArray<FAssetData> Assets;
+        ARM.Get().GetAssets(Filter, Assets);
+
+        const FString Wanted = FPaths::GetBaseFilename(Identifier);
+        for (const FAssetData& Data : Assets)
+        {
+            if (Data.AssetName.ToString() == Wanted)
+            {
+                return Cast<UBlueprint>(Data.GetAsset());
+            }
+        }
+        return nullptr;
+    }
+
+    TArray<TSharedPtr<FJsonValue>> MCPGraphsToJson(const TArray<UEdGraph*>& Graphs)
+    {
+        TArray<TSharedPtr<FJsonValue>> Out;
+        for (UEdGraph* Graph : Graphs)
+        {
+            if (!Graph)
+            {
+                continue;
+            }
+            TSharedPtr<FJsonObject> GraphObj = MakeShared<FJsonObject>();
+            GraphObj->SetStringField(TEXT("name"), Graph->GetName());
+            GraphObj->SetNumberField(TEXT("num_nodes"), Graph->Nodes.Num());
+            Out.Add(MakeShared<FJsonValueObject>(GraphObj));
+        }
+        return Out;
+    }
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleGetBlueprintInfo(const TSharedPtr<FJsonObject>& Params)
+{
+    FString BlueprintName;
+    if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
+    }
+
+    UBlueprint* Blueprint = MCPFindBlueprintFlexible(BlueprintName);
+    if (!Blueprint)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetStringField(TEXT("name"), Blueprint->GetName());
+    Data->SetStringField(TEXT("path"), Blueprint->GetPathName());
+    if (Blueprint->ParentClass)
+    {
+        Data->SetStringField(TEXT("parent_class"), Blueprint->ParentClass->GetName());
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Components;
+    if (Blueprint->SimpleConstructionScript)
+    {
+        for (USCS_Node* Node : Blueprint->SimpleConstructionScript->GetAllNodes())
+        {
+            if (!Node)
+            {
+                continue;
+            }
+            TSharedPtr<FJsonObject> Comp = MakeShared<FJsonObject>();
+            Comp->SetStringField(TEXT("name"), Node->GetVariableName().ToString());
+            if (Node->ComponentTemplate)
+            {
+                Comp->SetStringField(TEXT("class"), Node->ComponentTemplate->GetClass()->GetName());
+            }
+            if (USCS_Node* Parent = Blueprint->SimpleConstructionScript->FindParentNode(Node))
+            {
+                Comp->SetStringField(TEXT("attached_to"), Parent->GetVariableName().ToString());
+            }
+            Components.Add(MakeShared<FJsonValueObject>(Comp));
+        }
+    }
+    Data->SetArrayField(TEXT("components"), Components);
+
+    TArray<TSharedPtr<FJsonValue>> Variables;
+    for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+    {
+        TSharedPtr<FJsonObject> VarObj = MakeShared<FJsonObject>();
+        VarObj->SetStringField(TEXT("name"), Var.VarName.ToString());
+        VarObj->SetStringField(TEXT("type"), MCPPinTypeToString(Var.VarType));
+        Variables.Add(MakeShared<FJsonValueObject>(VarObj));
+    }
+    Data->SetArrayField(TEXT("variables"), Variables);
+
+    Data->SetArrayField(TEXT("functions"), MCPGraphsToJson(Blueprint->FunctionGraphs));
+
+    TSharedPtr<FJsonObject> Graphs = MakeShared<FJsonObject>();
+    Graphs->SetArrayField(TEXT("event_graphs"), MCPGraphsToJson(Blueprint->UbergraphPages));
+    Graphs->SetArrayField(TEXT("function_graphs"), MCPGraphsToJson(Blueprint->FunctionGraphs));
+    Graphs->SetArrayField(TEXT("macro_graphs"), MCPGraphsToJson(Blueprint->MacroGraphs));
+    Data->SetObjectField(TEXT("graphs"), Graphs);
+
+    return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleCreateBlueprint(const TSharedPtr<FJsonObject>& Params)

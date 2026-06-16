@@ -277,9 +277,46 @@ def register_blueprint_tools(mcp: FastMCP):
             
             logger.info(f"Compile blueprint response: {response}")
             return response
-            
+
         except Exception as e:
             error_msg = f"Error compiling blueprint: {e}"
+            logger.error(error_msg)
+            return {"success": False, "message": error_msg}
+
+    @mcp.tool()
+    def get_blueprint_info(
+        ctx: Context,
+        blueprint_name: str
+    ) -> Dict[str, Any]:
+        """Introspect an existing Blueprint: components, variables, functions, and graphs.
+
+        Args:
+            blueprint_name: Bare asset name (e.g. CH_FirstPersonPlayable), a full
+                object path, or a name under /Game/Blueprints/. Resolved project-wide.
+
+        Returns name, path, parent_class, components (name/class/attached_to),
+        variables (name/type), functions (name/num_nodes), and a graphs breakdown
+        (event_graphs, function_graphs, macro_graphs).
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                logger.error("Failed to connect to Unreal Engine")
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+
+            response = unreal.send_command("get_blueprint_info", {"blueprint_name": blueprint_name})
+
+            if not response:
+                logger.error("No response from Unreal Engine")
+                return {"success": False, "message": "No response from Unreal Engine"}
+
+            logger.info(f"Get blueprint info response: {response}")
+            return response
+
+        except Exception as e:
+            error_msg = f"Error getting blueprint info: {e}"
             logger.error(error_msg)
             return {"success": False, "message": error_msg}
 
