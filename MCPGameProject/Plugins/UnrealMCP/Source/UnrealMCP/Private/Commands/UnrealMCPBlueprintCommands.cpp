@@ -35,6 +35,7 @@
 #include "Misc/PackageName.h"
 #include "Misc/Guid.h"
 #include "HAL/FileManager.h"
+#include "DiffUtils.h"
 
 FUnrealMCPBlueprintCommands::FUnrealMCPBlueprintCommands()
 {
@@ -89,6 +90,14 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleCommand(const FString
     else if (CommandType == TEXT("diff_blueprint"))
     {
         return HandleDiffBlueprint(Params);
+    }
+    else if (CommandType == TEXT("diff_asset"))
+    {
+        return HandleDiffAsset(Params);
+    }
+    else if (CommandType == TEXT("get_asset_info"))
+    {
+        return HandleGetAssetInfo(Params);
     }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown blueprint command: %s"), *CommandType));
@@ -266,6 +275,154 @@ namespace
             }
         }
         return nullptr;
+    }
+
+    // Resolve ANY asset (not just blueprints) by path or bare name.
+    UObject* MCPFindAssetFlexible(const FString& Identifier)
+    {
+        if (Identifier.IsEmpty())
+        {
+            return nullptr;
+        }
+        if (Identifier.StartsWith(TEXT("/")))
+        {
+            if (UObject* Obj = LoadObject<UObject>(nullptr, *Identifier))
+            {
+                return Obj;
+            }
+        }
+        FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+        TArray<FAssetData> Assets;
+        ARM.Get().GetAllAssets(Assets);
+        const FString Wanted = FPaths::GetBaseFilename(Identifier);
+        for (const FAssetData& Data : Assets)
+        {
+            if (Data.AssetName.ToString() == Wanted)
+            {
+                return Data.GetAsset();
+            }
+        }
+        return nullptr;
+    }
+
+    // Load ANY asset's older version for diff (the RF_Standalone primary object).
+    UObject* MCPLoadAssetForDiff(const FString& InPath)
+    {
+        if (!FPaths::FileExists(InPath))
+        {
+            return nullptr;
+        }
+        FString BaseName = FPaths::GetBaseFilename(InPath);
+        const TCHAR* Invalid = INVALID_LONGPACKAGE_CHARACTERS;
+        for (; *Invalid; ++Invalid)
+        {
+            const TCHAR InvalidStr[] = { *Invalid, '\0' };
+            BaseName.ReplaceInline(InvalidStr, TEXT("_"));
+        }
+        const FString DiffPath = FString::Printf(TEXT("%s%s_mcpdiff_%s%s"), *FPaths::DiffDir(), *BaseName, *FGuid::NewGuid().ToString(EGuidFormats::Digits), *FPaths::GetExtension(InPath, true));
+        if (IFileManager::Get().Copy(*DiffPath, *InPath, true, true) != COPY_OK)
+        {
+            return nullptr;
+        }
+        UPackage* Package = LoadPackage(nullptr, *DiffPath, LOAD_ForDiff);
+        if (!Package)
+        {
+            return nullptr;
+        }
+        TArray<UObject*> Objects;
+        GetObjectsWithPackage(Package, Objects);
+        UObject* Fallback = nullptr;
+        for (UObject* Obj : Objects)
+        {
+            if (!Obj || Obj->IsA<UPackage>())
+            {
+                continue;
+            }
+            if (Obj->HasAnyFlags(RF_Standalone))
+            {
+                return Obj;
+            }
+            if (!Fallback)
+            {
+                Fallback = Obj;
+            }
+        }
+        return Fallback;
+    }
+
+    FString MCPPropertyDiffTypeToString(EPropertyDiffType::Type DiffType)
+    {
+        switch (DiffType)
+        {
+            case EPropertyDiffType::PropertyAddedToA:     return TEXT("removed");
+            case EPropertyDiffType::PropertyAddedToB:     return TEXT("added");
+            case EPropertyDiffType::PropertyValueChanged: return TEXT("changed");
+            default:                                      return TEXT("unknown");
+        }
+    }
+
+    // Pair graphs by name between two blueprints and append the FGraphDiffControl
+    // results as JSON. Shared by diff_blueprint and diff_asset.
+    void MCPAppendBlueprintGraphDiffs(UBlueprint* BaseBP, UBlueprint* CurrentBP, const FString& GraphFilter,
+                                      TArray<TSharedPtr<FJsonValue>>& Diffs, int32& GraphsCompared)
+    {
+        TMap<FString, UEdGraph*> BaseByName;
+        for (const FMCPGraphEntry& Entry : MCPCollectAllGraphs(BaseBP))
+        {
+            if (Entry.Graph) { BaseByName.Add(Entry.Graph->GetName(), Entry.Graph); }
+        }
+        TMap<FString, UEdGraph*> CurrentByName;
+        for (const FMCPGraphEntry& Entry : MCPCollectAllGraphs(CurrentBP))
+        {
+            if (Entry.Graph) { CurrentByName.Add(Entry.Graph->GetName(), Entry.Graph); }
+        }
+
+        auto EmitPresence = [&Diffs](const FString& GraphName, const TCHAR* Category, const FString& Display)
+        {
+            TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+            Entry->SetStringField(TEXT("graph"), GraphName);
+            Entry->SetStringField(TEXT("category"), Category);
+            Entry->SetStringField(TEXT("display"), Display);
+            Diffs.Add(MakeShared<FJsonValueObject>(Entry));
+        };
+
+        for (const TPair<FString, UEdGraph*>& Pair : CurrentByName)
+        {
+            const FString& Name = Pair.Key;
+            if (!GraphFilter.IsEmpty() && !Name.Equals(GraphFilter, ESearchCase::IgnoreCase)) { continue; }
+            UEdGraph** BaseGraph = BaseByName.Find(Name);
+            if (!BaseGraph)
+            {
+                EmitPresence(Name, TEXT("addition"), FString::Printf(TEXT("Graph '%s' added"), *Name));
+                continue;
+            }
+            ++GraphsCompared;
+            TArray<FDiffSingleResult> Results;
+            FGraphDiffControl::DiffGraphs(*BaseGraph, Pair.Value, Results);
+            for (const FDiffSingleResult& Result : Results)
+            {
+                if (Result.Diff == EDiffType::NO_DIFFERENCE) { continue; }
+                TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+                Entry->SetStringField(TEXT("graph"), Name);
+                Entry->SetStringField(TEXT("category"), MCPDiffCategoryToString(Result.Category));
+                Entry->SetStringField(TEXT("display"), Result.DisplayString.ToString());
+                if (Result.Node1) { Entry->SetStringField(TEXT("base_node"), Result.Node1->NodeGuid.ToString()); }
+                if (Result.Node2) { Entry->SetStringField(TEXT("current_node"), Result.Node2->NodeGuid.ToString()); }
+                if (Result.Pin1) { Entry->SetStringField(TEXT("base_pin"), Result.Pin1->PinName.ToString()); }
+                if (Result.Pin2) { Entry->SetStringField(TEXT("current_pin"), Result.Pin2->PinName.ToString()); }
+                Diffs.Add(MakeShared<FJsonValueObject>(Entry));
+            }
+        }
+
+        for (const TPair<FString, UEdGraph*>& Pair : BaseByName)
+        {
+            const FString& Name = Pair.Key;
+            if (!GraphFilter.IsEmpty() && !Name.Equals(GraphFilter, ESearchCase::IgnoreCase)) { continue; }
+            if (!CurrentByName.Contains(Name))
+            {
+                EmitPresence(Name, TEXT("subtraction"), FString::Printf(TEXT("Graph '%s' removed"), *Name));
+            }
+        }
     }
 }
 
@@ -616,6 +773,136 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleDiffBlueprint(const T
     Data->SetNumberField(TEXT("graphs_compared"), GraphsCompared);
     Data->SetNumberField(TEXT("num_differences"), Diffs.Num());
     Data->SetArrayField(TEXT("differences"), Diffs);
+    return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleDiffAsset(const TSharedPtr<FJsonObject>& Params)
+{
+    FString AssetName;
+    if (!Params->TryGetStringField(TEXT("asset_name"), AssetName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'asset_name' parameter"));
+    }
+    FString BasePath;
+    if (!Params->TryGetStringField(TEXT("base_version_path"), BasePath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'base_version_path' parameter"));
+    }
+    FString GraphFilter;
+    Params->TryGetStringField(TEXT("graph_name"), GraphFilter);
+
+    UObject* Current = MCPFindAssetFlexible(AssetName);
+    if (!Current)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Asset not found: %s"), *AssetName));
+    }
+    UObject* Base = MCPLoadAssetForDiff(BasePath);
+    if (!Base)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Could not load base version: %s"), *BasePath));
+    }
+
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetStringField(TEXT("asset"), Current->GetName());
+    Data->SetStringField(TEXT("asset_type"), Current->GetClass()->GetName());
+    Data->SetStringField(TEXT("base"), BasePath);
+
+    UBlueprint* CurrentBP = Cast<UBlueprint>(Current);
+    UBlueprint* BaseBP = Cast<UBlueprint>(Base);
+
+    // Graph diffs: blueprints only.
+    if (CurrentBP && BaseBP)
+    {
+        TArray<TSharedPtr<FJsonValue>> GraphDiffs;
+        int32 GraphsCompared = 0;
+        MCPAppendBlueprintGraphDiffs(BaseBP, CurrentBP, GraphFilter, GraphDiffs, GraphsCompared);
+        Data->SetNumberField(TEXT("graphs_compared"), GraphsCompared);
+        Data->SetNumberField(TEXT("num_graph_differences"), GraphDiffs.Num());
+        Data->SetArrayField(TEXT("graph_differences"), GraphDiffs);
+    }
+
+    // Property diffs: the CDO for blueprints, the asset itself for everything else.
+    UObject* PropA = Base;
+    UObject* PropB = Current;
+    if (CurrentBP && BaseBP)
+    {
+        PropA = BaseBP->GeneratedClass ? BaseBP->GeneratedClass->GetDefaultObject() : nullptr;
+        PropB = CurrentBP->GeneratedClass ? CurrentBP->GeneratedClass->GetDefaultObject() : nullptr;
+    }
+    TArray<TSharedPtr<FJsonValue>> PropDiffs;
+    if (PropA && PropB)
+    {
+        TArray<FSingleObjectDiffEntry> Entries;
+        DiffUtils::CompareUnrelatedObjects(PropA, PropB, Entries);
+        for (const FSingleObjectDiffEntry& Entry : Entries)
+        {
+            TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+            Obj->SetStringField(TEXT("property"), Entry.Identifier.ToDisplayName());
+            Obj->SetStringField(TEXT("change"), MCPPropertyDiffTypeToString(Entry.DiffType));
+            PropDiffs.Add(MakeShared<FJsonValueObject>(Obj));
+        }
+    }
+    Data->SetNumberField(TEXT("num_property_differences"), PropDiffs.Num());
+    Data->SetArrayField(TEXT("property_differences"), PropDiffs);
+
+    return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleGetAssetInfo(const TSharedPtr<FJsonObject>& Params)
+{
+    FString AssetName;
+    if (!Params->TryGetStringField(TEXT("asset_name"), AssetName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'asset_name' parameter"));
+    }
+    UObject* Asset = MCPFindAssetFlexible(AssetName);
+    if (!Asset)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Asset not found: %s"), *AssetName));
+    }
+
+    // Blueprint → reuse the rich blueprint introspection.
+    if (Cast<UBlueprint>(Asset))
+    {
+        TSharedPtr<FJsonObject> Forward = MakeShared<FJsonObject>();
+        Forward->SetStringField(TEXT("blueprint_name"), AssetName);
+        return HandleGetBlueprintInfo(Forward);
+    }
+
+    // Any other asset → type + editable property dump (settings).
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetStringField(TEXT("name"), Asset->GetName());
+    Data->SetStringField(TEXT("path"), Asset->GetPathName());
+    Data->SetStringField(TEXT("asset_type"), Asset->GetClass()->GetName());
+
+    TArray<TSharedPtr<FJsonValue>> Supers;
+    for (UClass* Super = Asset->GetClass()->GetSuperClass(); Super; Super = Super->GetSuperClass())
+    {
+        Supers.Add(MakeShared<FJsonValueString>(Super->GetName()));
+    }
+    Data->SetArrayField(TEXT("parent_classes"), Supers);
+
+    TArray<TSharedPtr<FJsonValue>> Props;
+    for (TFieldIterator<FProperty> It(Asset->GetClass()); It; ++It)
+    {
+        FProperty* Prop = *It;
+        if (!Prop || !Prop->HasAnyPropertyFlags(CPF_Edit | CPF_BlueprintVisible))
+        {
+            continue;
+        }
+        FString Value;
+        Prop->ExportText_InContainer(0, Value, Asset, nullptr, Asset, PPF_None);
+        if (Value.Len() > 240)
+        {
+            Value = Value.Left(240) + TEXT("…");
+        }
+        TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("name"), Prop->GetName());
+        Obj->SetStringField(TEXT("type"), Prop->GetCPPType());
+        Obj->SetStringField(TEXT("value"), Value);
+        Props.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+    Data->SetArrayField(TEXT("properties"), Props);
     return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
 }
 

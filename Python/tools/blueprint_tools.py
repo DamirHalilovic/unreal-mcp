@@ -421,6 +421,80 @@ def register_blueprint_tools(mcp: FastMCP):
             return {"success": False, "message": error_msg}
 
     @mcp.tool()
+    def get_asset_info(
+        ctx: Context,
+        asset_name: str
+    ) -> Dict[str, Any]:
+        """Inspect ANY asset — the tool detects the type itself, so you don't have to
+        guess from the .uasset. Use this first when you don't know what an asset is.
+
+        For a Blueprint it returns the full blueprint info (components/variables/
+        functions/graphs). For anything else (data asset, curve, texture, mesh, …) it
+        returns asset_type, parent_classes, and a properties[] dump (editable settings:
+        name/type/value) — settings, not pixels/geometry.
+
+        Args:
+            asset_name: Bare asset name, full object path, or /Game/ path.
+        """
+        from unreal_mcp_server import get_unreal_connection
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            response = unreal.send_command("get_asset_info", {"asset_name": asset_name})
+            if not response:
+                return {"success": False, "message": "No response from Unreal Engine"}
+            logger.info(f"Get asset info response received ({len(str(response))} chars)")
+            return response
+        except Exception as e:
+            error_msg = f"Error getting asset info: {e}"
+            logger.error(error_msg)
+            return {"success": False, "message": error_msg}
+
+    @mcp.tool()
+    def diff_asset(
+        ctx: Context,
+        asset_name: str,
+        base_version_path: str,
+        graph_name: str = ""
+    ) -> Dict[str, Any]:
+        """Structured diff of ANY asset against an older version — the tool detects the
+        type itself and routes: Blueprints get a graph diff (FGraphDiffControl) plus a
+        property/CDO diff; data assets / curves / textures / meshes get a property
+        ('settings') diff via UE's CompareUnrelatedObjects. Not a visual/pixel diff.
+
+        Use this instead of diff_blueprint when you don't know (or don't want to assume)
+        the asset's type — a .uasset is opaque until loaded.
+
+        Args:
+            asset_name: The CURRENT (live) asset — bare name, path, or /Game/ path.
+            base_version_path: Absolute path to a .uasset of the OLDER revision
+                (make it with svn cat / .claude/tools/bpdiff.ps1).
+            graph_name: Optional — restrict the (blueprint) graph diff to one graph.
+
+        Returns asset, asset_type, base, property_differences[] (property + change:
+        added/removed/changed), and for blueprints also graph_differences[] (category +
+        display + node GUIDs).
+        """
+        from unreal_mcp_server import get_unreal_connection
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            response = unreal.send_command(
+                "diff_asset",
+                {"asset_name": asset_name, "base_version_path": base_version_path, "graph_name": graph_name},
+            )
+            if not response:
+                return {"success": False, "message": "No response from Unreal Engine"}
+            logger.info(f"Diff asset response received ({len(str(response))} chars)")
+            return response
+        except Exception as e:
+            error_msg = f"Error diffing asset: {e}"
+            logger.error(error_msg)
+            return {"success": False, "message": error_msg}
+
+    @mcp.tool()
     def set_blueprint_property(
         ctx: Context,
         blueprint_name: str,
