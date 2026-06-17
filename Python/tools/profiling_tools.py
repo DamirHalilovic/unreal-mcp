@@ -296,16 +296,31 @@ def register_profiling_tools(mcp):
             return {"success": False, "message": f"Error analyzing csv profile: {e}"}
 
     @mcp.tool()
-    def analyze_trace(ctx, trace_path: str, top: int = 25):
-        """Summarize an Unreal Insights .utrace via TraceServices in the editor: frame stats
-        (game/render FPS + percentiles + hitches) and the top CPU and GPU timers by total
-        time. Requires the editor running (this forwards to the C++ analyze_trace command)."""
+    def analyze_trace(ctx, trace_path: str, top: int = 25, sections: str = "all"):
+        """Summarize an Unreal Insights .utrace via TraceServices in the editor. Requires the
+        editor running (forwards to the C++ analyze_trace command).
+
+        Always returns: `frames` (game/render FPS + p50/p90/p99 percentiles + hitches) and
+        `top_cpu_timers` / `top_gpu_timers` (by total inclusive time).
+
+        `sections` selects the heavier optional passes — "all" (default) or a comma list of:
+          - counters       -> `counters`: NumDraws/NumPrimitives/STAT_* (min/max/avg/last)
+          - memory         -> `memory_llm`: LLM tracker tags by peak MB (Total/WorkingSet/
+                              AssetRegistry/Textures/Untracked...). EMPTY unless the editor was
+                              launched with -llm.
+          - regions        -> `regions`: named timeline markers (e.g. PIE / PIE.Startup)
+          - bookmarks      -> `bookmarks`: TRACE_BOOKMARK markers (e.g. GC, PIE)
+          - loadtime       -> `loadtime_events`: async package-load aggregation. EMPTY unless
+                              the trace captured async loads with the `loadtime` channel.
+        Use e.g. sections="frames" for a quick frame-only pass, or "memory,counters" for a
+        memory sweep. `top` caps entries per list."""
         from unreal_mcp_server import get_unreal_connection
         try:
             unreal = get_unreal_connection()
             if not unreal:
                 return {"success": False, "message": "Failed to connect to Unreal Engine"}
-            response = unreal.send_command("analyze_trace", {"trace_path": trace_path, "top": top})
+            response = unreal.send_command(
+                "analyze_trace", {"trace_path": trace_path, "top": top, "sections": sections})
             return response or {"success": False, "message": "No response from Unreal Engine"}
         except Exception as e:
             return {"success": False, "message": f"Error analyzing trace: {e}"}
