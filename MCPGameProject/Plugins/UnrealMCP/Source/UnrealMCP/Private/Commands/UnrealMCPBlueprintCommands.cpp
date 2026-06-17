@@ -47,6 +47,8 @@
 #include "TraceServices/Model/TimingProfiler.h"
 #include "TraceServices/Containers/Tables.h"
 #include "ProfilingDebugging/MiscTrace.h"
+#include "ProfilingDebugging/TraceAuxiliary.h"
+#include "Engine/Engine.h"
 
 FUnrealMCPBlueprintCommands::FUnrealMCPBlueprintCommands()
 {
@@ -113,6 +115,18 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleCommand(const FString
     else if (CommandType == TEXT("analyze_trace"))
     {
         return HandleAnalyzeTrace(Params);
+    }
+    else if (CommandType == TEXT("capture_memreport"))
+    {
+        return HandleCaptureMemreport(Params);
+    }
+    else if (CommandType == TEXT("start_trace"))
+    {
+        return HandleStartTrace(Params);
+    }
+    else if (CommandType == TEXT("stop_trace"))
+    {
+        return HandleStopTrace(Params);
     }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown blueprint command: %s"), *CommandType));
@@ -1281,6 +1295,59 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleAnalyzeTrace(const TS
         }
     }
 
+    return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleCaptureMemreport(const TSharedPtr<FJsonObject>& Params)
+{
+    bool bFull = true;
+    Params->TryGetBoolField(TEXT("full"), bFull);
+    if (!GEngine)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No engine"));
+    }
+    const FString Dir = FPaths::ConvertRelativePathToFull(FPaths::ProfilingDir() + TEXT("MemReports/"));
+
+    // `memreport` defers the actual write to a later editor tick (MemReportDeferred), which
+    // can't run while this command blocks the game thread — so we only trigger it here and
+    // let the Python tool poll `dir` for the new .memreport file.
+    const bool bTriggered = GEngine->Exec(GWorld, bFull ? TEXT("memreport -full") : TEXT("memreport"));
+
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetBoolField(TEXT("triggered"), bTriggered);
+    Data->SetBoolField(TEXT("deferred"), true);
+    Data->SetStringField(TEXT("dir"), Dir);
+    return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleStartTrace(const TSharedPtr<FJsonObject>& Params)
+{
+    FString Channels;
+    if (!Params->TryGetStringField(TEXT("channels"), Channels) || Channels.IsEmpty())
+    {
+        Channels = TEXT("cpu,gpu,frame,counters,stats");
+    }
+    FString Path;
+    if (!Params->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        Path = FPaths::ConvertRelativePathToFull(FPaths::ProfilingDir() / TEXT("mcp_capture.utrace"));
+    }
+    const bool bOk = FTraceAuxiliary::Start(FTraceAuxiliary::EConnectionType::File, *Path, *Channels, nullptr);
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetBoolField(TEXT("started"), bOk);
+    Data->SetBoolField(TEXT("connected"), FTraceAuxiliary::IsConnected());
+    Data->SetStringField(TEXT("path"), Path);
+    Data->SetStringField(TEXT("channels"), Channels);
+    return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleStopTrace(const TSharedPtr<FJsonObject>& Params)
+{
+    const FString Dest = FTraceAuxiliary::GetTraceDestinationString();
+    const bool bOk = FTraceAuxiliary::Stop();
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetBoolField(TEXT("stopped"), bOk);
+    Data->SetStringField(TEXT("path"), Dest);
     return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
 }
 

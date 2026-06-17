@@ -252,7 +252,10 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("diff_blueprint") ||
                      CommandType == TEXT("diff_asset") ||
                      CommandType == TEXT("get_asset_info") ||
-                     CommandType == TEXT("analyze_trace"))
+                     CommandType == TEXT("analyze_trace") ||
+                     CommandType == TEXT("capture_memreport") ||
+                     CommandType == TEXT("start_trace") ||
+                     CommandType == TEXT("stop_trace"))
             {
                 ResultJson = BlueprintCommands->HandleCommand(CommandType, Params);
             }

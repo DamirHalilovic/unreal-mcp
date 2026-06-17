@@ -310,6 +310,75 @@ def register_profiling_tools(mcp):
         except Exception as e:
             return {"success": False, "message": f"Error analyzing trace: {e}"}
 
+    def _bridge(command, params):
+        from unreal_mcp_server import get_unreal_connection
+        unreal = get_unreal_connection()
+        if not unreal:
+            return {"success": False, "message": "Failed to connect to Unreal Engine"}
+        return unreal.send_command(command, params) or {"success": False, "message": "No response from Unreal Engine"}
+
+    @mcp.tool()
+    def capture_memreport(ctx, full: bool = True, timeout_s: float = 30.0):
+        """Capture a fresh .memreport in the running editor and return the generated file's
+        path — feed it straight to analyze_memreport. The `memreport` command writes
+        deferred (a later editor tick), so this triggers it then polls the filesystem for
+        the new file. Requires the editor running."""
+        import os
+        import time
+        try:
+            t0 = time.time() - 2.0
+            r = _bridge("capture_memreport", {"full": full})
+            d = (r.get("result") or {}).get("data") or r
+            dpath = d.get("dir")
+            if not dpath:
+                return r
+
+            def scan():
+                res = []
+                for root, _, files in os.walk(dpath):
+                    for f in files:
+                        if f.lower().endswith(".memreport"):
+                            p = os.path.join(root, f)
+                            try:
+                                res.append((p, os.path.getmtime(p)))
+                            except OSError:
+                                pass
+                return res
+
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                time.sleep(1.0)
+                fresh = [(p, m) for p, m in scan() if m >= t0]
+                if fresh:
+                    cand = max(fresh, key=lambda x: x[1])[0]
+                    sz = os.path.getsize(cand)
+                    time.sleep(0.8)  # let the deferred write finish
+                    if os.path.getsize(cand) == sz:
+                        return {"success": True, "captured": True, "path": cand, "dir": dpath}
+            return {"success": False, "captured": False, "dir": dpath,
+                    "message": f"memreport triggered but no new file within {timeout_s}s"}
+        except Exception as e:
+            return {"success": False, "message": f"Error capturing memreport: {e}"}
+
+    @mcp.tool()
+    def start_trace(ctx, channels: str = "cpu,gpu,frame,counters,stats", path: str = ""):
+        """Start an Unreal Insights .utrace capture in the running editor (FTraceAuxiliary).
+        Let the editor run/render for a while, then stop_trace, then analyze_trace. Returns
+        the trace file path. Requires the editor running."""
+        try:
+            return _bridge("start_trace", {"channels": channels, "path": path})
+        except Exception as e:
+            return {"success": False, "message": f"Error starting trace: {e}"}
+
+    @mcp.tool()
+    def stop_trace(ctx):
+        """Stop the in-progress .utrace capture and finalize the file. Returns its path —
+        then call analyze_trace on it. Requires the editor running."""
+        try:
+            return _bridge("stop_trace", {})
+        except Exception as e:
+            return {"success": False, "message": f"Error stopping trace: {e}"}
+
     logger.info("Profiling tools registered successfully")
 
 
