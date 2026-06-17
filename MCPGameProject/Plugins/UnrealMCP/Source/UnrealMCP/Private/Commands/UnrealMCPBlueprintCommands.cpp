@@ -51,6 +51,7 @@
 #include "TraceServices/Model/Bookmarks.h"
 #include "TraceServices/Model/LoadTimeProfiler.h"
 #include "TraceServices/Containers/Tables.h"
+#include "TraceServices/ModuleService.h"
 #include "Common/ProviderLock.h"
 #include "ProfilingDebugging/MiscTrace.h"
 #include "ProfilingDebugging/TraceAuxiliary.h"
@@ -1212,6 +1213,18 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleAnalyzeTrace(const TS
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("TraceServices analysis service unavailable"));
     }
+    // The "Asset Loading" (LoadTimeProfiler) module is opt-in (ShouldBeEnabledByDefault()
+    // returns false), so its provider is absent from Analyze() unless we enable it first.
+    {
+        FString SectionsPre;
+        Params->TryGetStringField(TEXT("sections"), SectionsPre);
+        const bool bWantLoad = SectionsPre.IsEmpty() || SectionsPre == TEXT("all") || SectionsPre.Contains(TEXT("loadtime"));
+        if (bWantLoad)
+        {
+            TSharedPtr<TraceServices::IModuleService> ModuleService = Module.GetModuleService();
+            if (ModuleService.IsValid()) { ModuleService->SetModuleEnabled(FName(TEXT("TraceModule_LoadTimeProfiler")), true); }
+        }
+    }
     // Loads, analyzes, and waits for completion.
     TSharedPtr<const TraceServices::IAnalysisSession> Session = Service->Analyze(*TracePath);
     if (!Session.IsValid())
@@ -1428,35 +1441,58 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleAnalyzeTrace(const TS
 
     if (Want(TEXT("loadtime")))
     {
-        TArray<TSharedPtr<FJsonValue>> Out;
-        const TraceServices::ILoadTimeProfilerProvider* Load = TraceServices::ReadLoadTimeProfilerProvider(*Session);
-        if (Load)
+        struct FLoadEvt { FString Name; double TotalMs; uint64 Count; };
+        auto ReadAgg = [Top](TraceServices::ITable<TraceServices::FLoadTimeProfilerAggregatedStats>* Table, TArray<FLoadEvt>& Events)
         {
-            TraceServices::ITable<TraceServices::FLoadTimeProfilerAggregatedStats>* LoadTable = Load->CreateEventAggregation(0.0, Duration);
-            if (LoadTable)
+            if (!Table) { return; }
+            TraceServices::ITableReader<TraceServices::FLoadTimeProfilerAggregatedStats>* Reader = Table->CreateReader();
+            for (; Reader && Reader->IsValid(); Reader->NextRow())
             {
-                struct FLoadEvt { FString Name; double TotalMs; uint64 Count; };
-                TArray<FLoadEvt> Events;
-                TraceServices::ITableReader<TraceServices::FLoadTimeProfilerAggregatedStats>* Reader = LoadTable->CreateReader();
-                for (; Reader && Reader->IsValid(); Reader->NextRow())
-                {
-                    const TraceServices::FLoadTimeProfilerAggregatedStats* Row = Reader->GetCurrentRow();
-                    if (Row) { Events.Add({ Row->Name ? Row->Name : TEXT("?"), Row->Total * 1000.0, Row->Count }); }
-                }
-                delete Reader;
-                delete LoadTable;
-                Events.Sort([](const FLoadEvt& A, const FLoadEvt& B) { return A.TotalMs > B.TotalMs; });
-                for (int32 i = 0; i < Events.Num() && i < Top; ++i)
-                {
-                    TSharedPtr<FJsonObject> E = MakeShared<FJsonObject>();
-                    E->SetStringField(TEXT("name"), Events[i].Name);
-                    E->SetNumberField(TEXT("total_ms"), Events[i].TotalMs);
-                    E->SetNumberField(TEXT("count"), (double)Events[i].Count);
-                    Out.Add(MakeShared<FJsonValueObject>(E));
-                }
+                const TraceServices::FLoadTimeProfilerAggregatedStats* Row = Reader->GetCurrentRow();
+                if (Row && FMath::IsFinite(Row->Total)) { Events.Add({ Row->Name ? Row->Name : TEXT("?"), Row->Total * 1000.0, Row->Count }); }
+            }
+            delete Reader;
+            delete Table;
+        };
+
+        TArray<TSharedPtr<FJsonValue>> Out;
+        FString Status;
+        const TraceServices::ILoadTimeProfilerProvider* Load = TraceServices::ReadLoadTimeProfilerProvider(*Session);
+        if (!Load)
+        {
+            Status = TEXT("no load-time provider in session (loadtime channel was not traced)");
+        }
+        else
+        {
+            const uint64 Timelines = Load->GetTimelineCount();
+            TArray<FLoadEvt> Events;
+            ReadAgg(Load->CreateEventAggregation(0.0, Duration), Events);
+            FString Grouping = TEXT("event");
+            if (Events.Num() == 0)  // event aggregation empty -> fall back to object-type aggregation
+            {
+                ReadAgg(Load->CreateObjectTypeAggregation(0.0, Duration), Events);
+                Grouping = TEXT("object_type");
+            }
+            Events.Sort([](const FLoadEvt& A, const FLoadEvt& B) { return A.TotalMs > B.TotalMs; });
+            for (int32 i = 0; i < Events.Num() && i < Top; ++i)
+            {
+                TSharedPtr<FJsonObject> E = MakeShared<FJsonObject>();
+                E->SetStringField(TEXT("name"), Events[i].Name);
+                E->SetNumberField(TEXT("total_ms"), Events[i].TotalMs);
+                E->SetNumberField(TEXT("count"), (double)Events[i].Count);
+                Out.Add(MakeShared<FJsonValueObject>(E));
+            }
+            if (Out.Num() == 0)
+            {
+                Status = FString::Printf(TEXT("provider present, %llu timelines, but no aggregated load events in [0,%.1fs] - trace likely captured no async package loads in window"), (unsigned long long)Timelines, Duration);
+            }
+            else
+            {
+                Status = FString::Printf(TEXT("ok (%llu timelines, grouped by %s)"), (unsigned long long)Timelines, *Grouping);
             }
         }
         Data->SetArrayField(TEXT("loadtime_events"), Out);
+        Data->SetStringField(TEXT("loadtime_status"), Status);
     }
 
     return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);

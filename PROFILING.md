@@ -31,8 +31,8 @@ Typical loop: `start_trace` → let the editor run/render a while → `stop_trac
 
 **To populate the heavier sections** (a runtime `start_trace` is not enough for these):
 - **`memory_llm`** needs the LLM tracker active — launch the editor with **`-llm`** (LLM tag samples are only emitted when LLM is on). With it, you get a Default-tracker breakdown (Total / WorkingSetSize / AssetRegistry / Textures / Untracked / FMallocUnused … by peak MB) — ideal for memory-regression hunting.
-- **`loadtime_events`** needs the **`loadtime`** trace channel *and* async package loads to occur inside the capture window. Easiest is a **startup trace**: launch with
-  `-trace=cpu,gpu,frame,counters,stats,memtag,loadtime,assetloadtime -tracefile=<path>` (add `-llm` for memory too), let it load, then `stop_trace`. (Note: editor traces using the Zen/EDL loader may still emit no LoadTimeProfiler events — the section then returns an empty array, not an error.)
+- **`loadtime_events`** needs the **`loadtime`** trace channel *and* async package loads inside the capture window. Easiest is a **startup trace**: launch with
+  `-trace=cpu,gpu,frame,counters,stats,memtag,loadtime,assetloadtime -tracefile=<path>` (add `-llm` for memory too), let it load, then `stop_trace`. Returns per-asset load time + load count (e.g. a blueprint loaded 1000+ times is a red flag). The "Asset Loading" TraceServices module is **opt-in** (`ShouldBeEnabledByDefault()==false`), so `analyze_trace` enables it via `SetModuleEnabled("TraceModule_LoadTimeProfiler")` before analyzing — without that the provider is absent and the section is silently empty. The `loadtime_status` field reports the provider/timeline state so an empty result is never mistaken for "no load cost."
 - **`counters` / `regions` / `bookmarks`** populate from a normal runtime `start_trace` (regions/bookmarks need PIE or code that emits `TRACE_BOOKMARK`/region markers).
 
 ## Implementation
