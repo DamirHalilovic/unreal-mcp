@@ -40,6 +40,13 @@
 #include "GameFramework/WorldSettings.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
+#include "TraceServices/ITraceServicesModule.h"
+#include "TraceServices/AnalysisService.h"
+#include "TraceServices/Model/AnalysisSession.h"
+#include "TraceServices/Model/Frames.h"
+#include "TraceServices/Model/TimingProfiler.h"
+#include "TraceServices/Containers/Tables.h"
+#include "ProfilingDebugging/MiscTrace.h"
 
 FUnrealMCPBlueprintCommands::FUnrealMCPBlueprintCommands()
 {
@@ -102,6 +109,10 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleCommand(const FString
     else if (CommandType == TEXT("get_asset_info"))
     {
         return HandleGetAssetInfo(Params);
+    }
+    else if (CommandType == TEXT("analyze_trace"))
+    {
+        return HandleAnalyzeTrace(Params);
     }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown blueprint command: %s"), *CommandType));
@@ -1155,6 +1166,121 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleGetAssetInfo(const TS
         Props.Add(MakeShared<FJsonValueObject>(Obj));
     }
     Data->SetArrayField(TEXT("properties"), Props);
+    return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleAnalyzeTrace(const TSharedPtr<FJsonObject>& Params)
+{
+    FString TracePath;
+    if (!Params->TryGetStringField(TEXT("trace_path"), TracePath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'trace_path' parameter"));
+    }
+    int32 Top = 25;
+    {
+        double TopD = 25.0;
+        if (Params->TryGetNumberField(TEXT("top"), TopD)) { Top = FMath::Max(1, (int32)TopD); }
+    }
+    if (!FPaths::FileExists(TracePath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Trace file not found: %s"), *TracePath));
+    }
+
+    ITraceServicesModule& Module = FModuleManager::LoadModuleChecked<ITraceServicesModule>(TEXT("TraceServices"));
+    TSharedPtr<TraceServices::IAnalysisService> Service = Module.GetAnalysisService();
+    if (!Service.IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("TraceServices analysis service unavailable"));
+    }
+    // Loads, analyzes, and waits for completion.
+    TSharedPtr<const TraceServices::IAnalysisSession> Session = Service->Analyze(*TracePath);
+    if (!Session.IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to analyze trace: %s"), *TracePath));
+    }
+
+    TraceServices::FAnalysisSessionReadScope ReadScope(*Session);
+    const double Duration = Session->GetDurationSeconds();
+
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetStringField(TEXT("trace"), TracePath);
+    Data->SetNumberField(TEXT("duration_seconds"), Duration);
+
+    auto FrameStats = [](TArray<double>& Ms) -> TSharedPtr<FJsonObject>
+    {
+        TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+        const int32 N = Ms.Num();
+        O->SetNumberField(TEXT("count"), N);
+        if (N == 0) { return O; }
+        Ms.Sort();
+        double Sum = 0.0; for (double D : Ms) { Sum += D; }
+        auto Pct = [&Ms, N](double P) { return Ms[FMath::Clamp((int32)FMath::RoundToInt((P / 100.0) * (N - 1)), 0, N - 1)]; };
+        O->SetNumberField(TEXT("avg_ms"), Sum / N);
+        O->SetNumberField(TEXT("min_ms"), Ms[0]);
+        O->SetNumberField(TEXT("max_ms"), Ms[N - 1]);
+        O->SetNumberField(TEXT("p50_ms"), Pct(50));
+        O->SetNumberField(TEXT("p90_ms"), Pct(90));
+        O->SetNumberField(TEXT("p99_ms"), Pct(99));
+        O->SetNumberField(TEXT("avg_fps"), Sum > 0.0 ? (N * 1000.0 / Sum) : 0.0);
+        return O;
+    };
+
+    const TraceServices::IFrameProvider& Frames = TraceServices::ReadFrameProvider(*Session);
+    TSharedPtr<FJsonObject> FramesObj = MakeShared<FJsonObject>();
+    const ETraceFrameType FrameTypes[2] = { TraceFrameType_Game, TraceFrameType_Rendering };
+    const TCHAR* FrameNames[2] = { TEXT("game"), TEXT("rendering") };
+    for (int32 i = 0; i < 2; ++i)
+    {
+        TArray<double> Durations;
+        Frames.EnumerateFrames(FrameTypes[i], 0, Frames.GetFrameCount(FrameTypes[i]), [&Durations](const TraceServices::FFrame& F)
+        {
+            // Skip the trailing incomplete frame (open at trace end → EndTime is non-finite).
+            const double D = (F.EndTime - F.StartTime) * 1000.0;
+            if (F.EndTime > F.StartTime && FMath::IsFinite(D)) { Durations.Add(D); }
+        });
+        FramesObj->SetObjectField(FrameNames[i], FrameStats(Durations));
+    }
+    Data->SetObjectField(TEXT("frames"), FramesObj);
+
+    const TraceServices::ITimingProfilerProvider* Timing = TraceServices::ReadTimingProfilerProvider(*Session);
+    if (Timing)
+    {
+        TraceServices::FCreateAggregationParams AggParams;
+        AggParams.IntervalStart = 0.0;
+        AggParams.IntervalEnd = (Duration > 0.0) ? Duration : DBL_MAX;
+        AggParams.CpuThreadFilter = [](uint32) { return true; };
+        AggParams.GpuQueueFilter = [](uint32) { return true; };
+        AggParams.SortBy = TraceServices::FCreateAggregationParams::ESortBy::TotalInclusiveTime;
+        AggParams.SortOrder = TraceServices::FCreateAggregationParams::ESortOrder::Descending;
+        AggParams.TableEntryLimit = Top * 6;
+
+        TraceServices::ITable<TraceServices::FTimingProfilerAggregatedStats>* Table = Timing->CreateAggregation(AggParams);
+        if (Table)
+        {
+            TArray<TSharedPtr<FJsonValue>> CpuTimers;
+            TArray<TSharedPtr<FJsonValue>> GpuTimers;
+            TraceServices::ITableReader<TraceServices::FTimingProfilerAggregatedStats>* Reader = Table->CreateReader();
+            for (; Reader && Reader->IsValid(); Reader->NextRow())
+            {
+                const TraceServices::FTimingProfilerAggregatedStats* Row = Reader->GetCurrentRow();
+                if (!Row || !Row->Timer) { continue; }
+                TArray<TSharedPtr<FJsonValue>>& Dst = Row->Timer->IsGpuTimer ? GpuTimers : CpuTimers;
+                if (Dst.Num() >= Top) { continue; }
+                TSharedPtr<FJsonObject> E = MakeShared<FJsonObject>();
+                E->SetStringField(TEXT("name"), Row->Timer->Name ? Row->Timer->Name : TEXT("?"));
+                E->SetNumberField(TEXT("total_ms"), FMath::IsFinite(Row->TotalInclusiveTime) ? Row->TotalInclusiveTime * 1000.0 : 0.0);
+                E->SetNumberField(TEXT("avg_ms"), FMath::IsFinite(Row->AverageInclusiveTime) ? Row->AverageInclusiveTime * 1000.0 : 0.0);
+                E->SetNumberField(TEXT("max_ms"), FMath::IsFinite(Row->MaxInclusiveTime) ? Row->MaxInclusiveTime * 1000.0 : 0.0);
+                E->SetNumberField(TEXT("count"), (double)Row->InstanceCount);
+                Dst.Add(MakeShared<FJsonValueObject>(E));
+            }
+            delete Reader;
+            delete Table;
+            Data->SetArrayField(TEXT("top_cpu_timers"), CpuTimers);
+            Data->SetArrayField(TEXT("top_gpu_timers"), GpuTimers);
+        }
+    }
+
     return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
 }
 

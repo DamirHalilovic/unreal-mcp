@@ -52,7 +52,9 @@ public class UnrealMCP : ModuleRules
 				"BlueprintGraph",
 				"GraphEditor",
 				"Projects",
-				"AssetRegistry"
+				"AssetRegistry",
+				"TraceServices",
+				"TraceLog"
 			}
 		);
 		

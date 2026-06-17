@@ -30,6 +30,7 @@ private:
     TSharedPtr<FJsonObject> HandleDiffBlueprint(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleDiffAsset(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleGetAssetInfo(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleAnalyzeTrace(const TSharedPtr<FJsonObject>& Params);
 
     // Helper functions
     TSharedPtr<FJsonObject> AddComponentToBlueprint(const FString& BlueprintName, const FString& ComponentType, 
