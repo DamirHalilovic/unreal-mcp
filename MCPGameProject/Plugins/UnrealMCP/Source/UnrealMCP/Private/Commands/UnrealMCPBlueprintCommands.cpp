@@ -45,7 +45,13 @@
 #include "TraceServices/Model/AnalysisSession.h"
 #include "TraceServices/Model/Frames.h"
 #include "TraceServices/Model/TimingProfiler.h"
+#include "TraceServices/Model/Counters.h"
+#include "TraceServices/Model/Memory.h"
+#include "TraceServices/Model/Regions.h"
+#include "TraceServices/Model/Bookmarks.h"
+#include "TraceServices/Model/LoadTimeProfiler.h"
 #include "TraceServices/Containers/Tables.h"
+#include "Common/ProviderLock.h"
 #include "ProfilingDebugging/MiscTrace.h"
 #include "ProfilingDebugging/TraceAuxiliary.h"
 #include "Engine/Engine.h"
@@ -1293,6 +1299,164 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleAnalyzeTrace(const TS
             Data->SetArrayField(TEXT("top_cpu_timers"), CpuTimers);
             Data->SetArrayField(TEXT("top_gpu_timers"), GpuTimers);
         }
+    }
+
+    // Optional extra sections (heavier). 'sections' = "all" (default) or a comma list of
+    // counters,memory,regions,bookmarks,loadtime.
+    FString Sections;
+    if (!Params->TryGetStringField(TEXT("sections"), Sections) || Sections.IsEmpty()) { Sections = TEXT("all"); }
+    auto Want = [&Sections](const TCHAR* Name) { return Sections == TEXT("all") || Sections.Contains(Name); };
+
+    if (Want(TEXT("counters")))
+    {
+        struct FCounterStat { FString Name; FString Group; double Min; double Max; double Avg; double Last; };
+        TArray<FCounterStat> Stats;
+        const TraceServices::ICounterProvider& CounterProvider = TraceServices::ReadCounterProvider(*Session);
+        CounterProvider.EnumerateCounters([&Stats, Duration](uint32, const TraceServices::ICounter& Counter)
+        {
+            double Min = DBL_MAX, Max = -DBL_MAX, Sum = 0.0, Last = 0.0;
+            int64 Count = 0;
+            auto Visit = [&](double, double V) { Min = FMath::Min(Min, V); Max = FMath::Max(Max, V); Sum += V; Last = V; ++Count; };
+            if (Counter.IsFloatingPoint())
+            {
+                Counter.EnumerateFloatValues(0.0, Duration, true, [&Visit](double T, double V) { Visit(T, V); });
+            }
+            else
+            {
+                Counter.EnumerateValues(0.0, Duration, true, [&Visit](double T, int64 V) { Visit(T, (double)V); });
+            }
+            if (Count == 0) { return; }
+            Stats.Add({ Counter.GetName() ? Counter.GetName() : TEXT("?"), Counter.GetGroup() ? Counter.GetGroup() : TEXT(""), Min, Max, Sum / Count, Last });
+        });
+        Stats.Sort([](const FCounterStat& A, const FCounterStat& B) { return A.Max > B.Max; });
+        TArray<TSharedPtr<FJsonValue>> Out;
+        for (int32 i = 0; i < Stats.Num() && i < Top; ++i)
+        {
+            TSharedPtr<FJsonObject> E = MakeShared<FJsonObject>();
+            E->SetStringField(TEXT("name"), Stats[i].Name);
+            if (!Stats[i].Group.IsEmpty()) { E->SetStringField(TEXT("group"), Stats[i].Group); }
+            E->SetNumberField(TEXT("min"), Stats[i].Min);
+            E->SetNumberField(TEXT("max"), Stats[i].Max);
+            E->SetNumberField(TEXT("avg"), Stats[i].Avg);
+            E->SetNumberField(TEXT("last"), Stats[i].Last);
+            Out.Add(MakeShared<FJsonValueObject>(E));
+        }
+        Data->SetArrayField(TEXT("counters"), Out);
+    }
+
+    if (Want(TEXT("memory")))
+    {
+        const TraceServices::IMemoryProvider* Mem = TraceServices::ReadMemoryProvider(*Session);
+        if (Mem)
+        {
+            Mem->BeginRead();
+            TraceServices::FMemoryTrackerId TrackerId = 0;
+            FString TrackerName;
+            bool bHaveTracker = false;
+            Mem->EnumerateTrackers([&](const TraceServices::FMemoryTrackerInfo& T)
+            {
+                if (!bHaveTracker || T.Name == TEXT("Default")) { TrackerId = T.Id; TrackerName = T.Name; bHaveTracker = true; }
+            });
+            struct FTagMem { FString Name; double CurrentMB; double PeakMB; };
+            TArray<FTagMem> Tags;
+            if (bHaveTracker)
+            {
+                Mem->EnumerateTags([&](const TraceServices::FMemoryTagInfo& Tag)
+                {
+                    if (Tags.Num() > 4096) { return; }
+                    int64 Last = 0, Peak = 0;
+                    bool bAny = false;
+                    Mem->EnumerateTagSamples(TrackerId, Tag.Id, 0.0, Duration, false, [&](double, double, const TraceServices::FMemoryTagSample& S)
+                    {
+                        Last = S.Value; if (S.Value > Peak) { Peak = S.Value; } bAny = true;
+                    });
+                    if (bAny) { Tags.Add({ Tag.Name, Last / (1024.0 * 1024.0), Peak / (1024.0 * 1024.0) }); }
+                });
+            }
+            Mem->EndRead();
+            Tags.Sort([](const FTagMem& A, const FTagMem& B) { return A.PeakMB > B.PeakMB; });
+            TArray<TSharedPtr<FJsonValue>> Out;
+            for (int32 i = 0; i < Tags.Num() && i < Top; ++i)
+            {
+                TSharedPtr<FJsonObject> E = MakeShared<FJsonObject>();
+                E->SetStringField(TEXT("tag"), Tags[i].Name);
+                E->SetNumberField(TEXT("current_mb"), Tags[i].CurrentMB);
+                E->SetNumberField(TEXT("peak_mb"), Tags[i].PeakMB);
+                Out.Add(MakeShared<FJsonValueObject>(E));
+            }
+            TSharedPtr<FJsonObject> MemObj = MakeShared<FJsonObject>();
+            MemObj->SetStringField(TEXT("tracker"), TrackerName);
+            MemObj->SetArrayField(TEXT("tags_by_peak"), Out);
+            Data->SetObjectField(TEXT("memory_llm"), MemObj);
+        }
+    }
+
+    if (Want(TEXT("regions")))
+    {
+        const TraceServices::IRegionProvider& RegionProvider = TraceServices::ReadRegionProvider(*Session);
+        TraceServices::FProviderReadScopeLock RegionScope(RegionProvider);
+        TArray<TSharedPtr<FJsonValue>> Out;
+        RegionProvider.GetDefaultTimeline().EnumerateRegions(0.0, Duration, [&Out, Top](const TraceServices::FTimeRegion& R) -> bool
+        {
+            if (Out.Num() >= Top) { return false; }
+            TSharedPtr<FJsonObject> E = MakeShared<FJsonObject>();
+            E->SetStringField(TEXT("name"), R.Text ? R.Text : TEXT("?"));
+            E->SetNumberField(TEXT("begin_s"), R.BeginTime);
+            const double Dur = (FMath::IsFinite(R.EndTime) && R.EndTime > R.BeginTime) ? (R.EndTime - R.BeginTime) : 0.0;
+            E->SetNumberField(TEXT("duration_ms"), Dur * 1000.0);
+            Out.Add(MakeShared<FJsonValueObject>(E));
+            return true;
+        });
+        Data->SetArrayField(TEXT("regions"), Out);
+    }
+
+    if (Want(TEXT("bookmarks")))
+    {
+        const TraceServices::IBookmarkProvider& BookmarkProvider = TraceServices::ReadBookmarkProvider(*Session);
+        TArray<TSharedPtr<FJsonValue>> Out;
+        const int32 Cap = Top * 4;
+        BookmarkProvider.EnumerateBookmarks(0.0, Duration, [&Out, Cap](const TraceServices::FBookmark& B)
+        {
+            if (Out.Num() >= Cap) { return; }
+            TSharedPtr<FJsonObject> E = MakeShared<FJsonObject>();
+            E->SetNumberField(TEXT("time_s"), B.Time);
+            E->SetStringField(TEXT("text"), B.Text ? B.Text : TEXT("?"));
+            Out.Add(MakeShared<FJsonValueObject>(E));
+        });
+        Data->SetArrayField(TEXT("bookmarks"), Out);
+    }
+
+    if (Want(TEXT("loadtime")))
+    {
+        TArray<TSharedPtr<FJsonValue>> Out;
+        const TraceServices::ILoadTimeProfilerProvider* Load = TraceServices::ReadLoadTimeProfilerProvider(*Session);
+        if (Load)
+        {
+            TraceServices::ITable<TraceServices::FLoadTimeProfilerAggregatedStats>* LoadTable = Load->CreateEventAggregation(0.0, Duration);
+            if (LoadTable)
+            {
+                struct FLoadEvt { FString Name; double TotalMs; uint64 Count; };
+                TArray<FLoadEvt> Events;
+                TraceServices::ITableReader<TraceServices::FLoadTimeProfilerAggregatedStats>* Reader = LoadTable->CreateReader();
+                for (; Reader && Reader->IsValid(); Reader->NextRow())
+                {
+                    const TraceServices::FLoadTimeProfilerAggregatedStats* Row = Reader->GetCurrentRow();
+                    if (Row) { Events.Add({ Row->Name ? Row->Name : TEXT("?"), Row->Total * 1000.0, Row->Count }); }
+                }
+                delete Reader;
+                delete LoadTable;
+                Events.Sort([](const FLoadEvt& A, const FLoadEvt& B) { return A.TotalMs > B.TotalMs; });
+                for (int32 i = 0; i < Events.Num() && i < Top; ++i)
+                {
+                    TSharedPtr<FJsonObject> E = MakeShared<FJsonObject>();
+                    E->SetStringField(TEXT("name"), Events[i].Name);
+                    E->SetNumberField(TEXT("total_ms"), Events[i].TotalMs);
+                    E->SetNumberField(TEXT("count"), (double)Events[i].Count);
+                    Out.Add(MakeShared<FJsonValueObject>(E));
+                }
+            }
+        }
+        Data->SetArrayField(TEXT("loadtime_events"), Out);
     }
 
     return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
