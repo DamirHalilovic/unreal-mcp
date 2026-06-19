@@ -252,6 +252,8 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("diff_blueprint") ||
                      CommandType == TEXT("diff_asset") ||
                      CommandType == TEXT("get_asset_info") ||
+                     CommandType == TEXT("get_behavior_tree") ||
+                     CommandType == TEXT("get_blackboard") ||
                      CommandType == TEXT("analyze_trace") ||
                      CommandType == TEXT("capture_memreport") ||
                      CommandType == TEXT("start_trace") ||

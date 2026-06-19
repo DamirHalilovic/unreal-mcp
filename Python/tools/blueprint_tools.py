@@ -452,6 +452,88 @@ def register_blueprint_tools(mcp: FastMCP):
             return {"success": False, "message": error_msg}
 
     @mcp.tool()
+    def get_behavior_tree(
+        ctx: Context,
+        behavior_tree_name: str
+    ) -> Dict[str, Any]:
+        """Walk a Behavior Tree asset's node structure — the omission the other graph
+        tools left. Detects composites/tasks/decorators/services and their parameters
+        the same way the BT editor shows them.
+
+        Args:
+            behavior_tree_name: Bare asset name (e.g. BT_Enemy), full object path, or
+                /Game/ path. Resolved project-wide.
+
+        Returns name, path, blackboard (the linked UBlackboardData), root_decorators[],
+        and root: a recursive node tree. Each node has kind (composite/task), class,
+        name, description (UE's GetStaticDescription — includes the blackboard keys it
+        reads/writes), services[] on composites/tasks, and children[] where each child
+        carries its decorators[] (the conditions guarding that branch) and node. Child
+        order is top-to-bottom execution order. Pair with get_blackboard for the keys.
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                logger.error("Failed to connect to Unreal Engine")
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+
+            response = unreal.send_command("get_behavior_tree", {"behavior_tree_name": behavior_tree_name})
+
+            if not response:
+                logger.error("No response from Unreal Engine")
+                return {"success": False, "message": "No response from Unreal Engine"}
+
+            logger.info(f"Get behavior tree response received ({len(str(response))} chars)")
+            return response
+
+        except Exception as e:
+            error_msg = f"Error getting behavior tree: {e}"
+            logger.error(error_msg)
+            return {"success": False, "message": error_msg}
+
+    @mcp.tool()
+    def get_blackboard(
+        ctx: Context,
+        blackboard_name: str
+    ) -> Dict[str, Any]:
+        """Dump a Blackboard (UBlackboardData) asset's keys — the data a Behavior Tree
+        reads and writes.
+
+        Args:
+            blackboard_name: Bare asset name (e.g. BB_Enemy), full object path, or
+                /Game/ path. Resolved project-wide.
+
+        Returns name, path, parent (the blackboard it inherits from, if any), num_keys,
+        and keys[]: each has name, type (Object/Bool/Vector/Enum/…), description,
+        instance_synced (synchronized across instances), and inherited (true for keys
+        from a parent blackboard, with from = the parent's name). Parent keys are listed
+        first so the list reads root-down.
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                logger.error("Failed to connect to Unreal Engine")
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+
+            response = unreal.send_command("get_blackboard", {"blackboard_name": blackboard_name})
+
+            if not response:
+                logger.error("No response from Unreal Engine")
+                return {"success": False, "message": "No response from Unreal Engine"}
+
+            logger.info(f"Get blackboard response received ({len(str(response))} chars)")
+            return response
+
+        except Exception as e:
+            error_msg = f"Error getting blackboard: {e}"
+            logger.error(error_msg)
+            return {"success": False, "message": error_msg}
+
+    @mcp.tool()
     def diff_asset(
         ctx: Context,
         base_version_path: str,

@@ -53,6 +53,7 @@ public class UnrealMCP : ModuleRules
 				"GraphEditor",
 				"Projects",
 				"AssetRegistry",
+				"AIModule",
 				"TraceServices",
 				"TraceLog"
 			}
